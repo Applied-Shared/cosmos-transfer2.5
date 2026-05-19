@@ -49,6 +49,16 @@ RESOLUTIONS: Mapping = {
 
 DEFAULT_CAMERA_KEYS = MULTIVIEW_CAMERA_KEYS
 DEFAULT_CAMERA_VIEW_MAPPING = {camera_key: idx for idx, camera_key in enumerate(DEFAULT_CAMERA_KEYS)}
+
+# Spatial 3x3 layout for the combined grid.mp4 output.
+# Each cell holds a camera key from MULTIVIEW_CAMERA_KEYS or None for a black tile.
+# Rows are top-to-bottom and columns are left-to-right, matching the car's
+# forward/backward and left/right axes so the grid reads like a top-down map.
+SPATIAL_GRID_LAYOUT: tuple[tuple[str | None, ...], ...] = (
+    (None, "front_tele", None),
+    ("cross_left", "front_wide", "cross_right"),
+    ("rear_left", "rear", "rear_right"),
+)
 DEFAULT_CAMERA_PREFIX_MAPPING = {
     "front_wide": "The video is captured from a camera mounted on a car. The camera is facing forward.",
     "cross_right": "The video is captured from a camera mounted on a car. The camera is facing to the right.",
@@ -397,15 +407,30 @@ class MultiviewInference:
                     save_img_or_video(view_tensor, view_output_path, fps=sample.fps, quality=8)
                     output_messages.append(f"{view_output_path}.mp4")
 
-                # Save grid video
-                grid_rows, grid_cols = 3, 3
+                # Save grid video using a spatial layout that mirrors the car's
+                # forward/backward and left/right axes. Cells without an active
+                # view stay black (zero-initialized).
+                grid_rows = len(SPATIAL_GRID_LAYOUT)
+                grid_cols = max(len(row) for row in SPATIAL_GRID_LAYOUT)
                 c, t, h, w = view_tensors[0][1].shape
                 grid_tensor = torch.zeros((c, t, grid_rows * h, grid_cols * w), dtype=video.dtype, device=video.device)
 
-                num_views_in_grid = min(len(view_tensors), grid_rows * grid_cols)
-                for idx in range(num_views_in_grid):
-                    row, col = idx // grid_cols, idx % grid_cols
-                    grid_tensor[:, :, row * h : (row + 1) * h, col * w : (col + 1) * w] = view_tensors[idx][1]
+                view_tensor_by_name = {view_name: view_tensor for view_name, view_tensor in view_tensors}
+                num_views_in_grid = 0
+                for row_idx, layout_row in enumerate(SPATIAL_GRID_LAYOUT):
+                    for col_idx, view_name in enumerate(layout_row):
+                        if view_name is None:
+                            continue
+                        view_tensor = view_tensor_by_name.get(view_name)
+                        if view_tensor is None:
+                            continue
+                        grid_tensor[
+                            :,
+                            :,
+                            row_idx * h : (row_idx + 1) * h,
+                            col_idx * w : (col_idx + 1) * w,
+                        ] = view_tensor
+                        num_views_in_grid += 1
 
                 grid_output_path = str(output_dir / "grid")
                 save_img_or_video(grid_tensor, grid_output_path, fps=sample.fps, quality=8)
