@@ -29,11 +29,12 @@ Usage (on an A100; locally on sm_120 it reaches the denoise wall, which is expec
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 
 import numpy as np
 from PIL import Image
@@ -95,14 +96,47 @@ def run_upstream_inference(args: argparse.Namespace, save_folder: str) -> None:
         raise RuntimeError(f"{_INFERENCE_MODULE} exited with code {result.returncode}")
 
 
+def _blend_chunk_frames(contributions: list[tuple[int, str]], num_frames: int) -> np.ndarray:
+    """Triangular-weighted blend of a frame predicted by multiple overlapping chunks.
+
+    A frame's weight within its chunk peaks at the chunk center and falls to ~0 at the
+    chunk edges (w = min(idx+1, num_frames-idx)). Where two chunks overlap, this
+    cross-fades them — the leaving chunk fades out as the entering chunk fades in — so
+    there is no hard seam at the boundary. (Mitigation pending Brick Diffusion, which
+    would instead share information across chunks during denoising.)
+    """
+    arrays, weights = [], []
+    for idx, path in contributions:
+        arrays.append(np.asarray(Image.open(path).convert("RGB"), dtype=np.float32))
+        weights.append(float(min(idx + 1, num_frames - idx)))
+    stack = np.stack(arrays, axis=0)
+    w = np.asarray(weights, dtype=np.float32).reshape(-1, 1, 1, 1)
+    blended = (stack * w).sum(axis=0) / w.sum()
+    return np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+
+
 def build_outputs(args: argparse.Namespace, save_folder: str) -> None:
-    """Reorganize upstream jpgs into albedo/ + build [input | albedo] mosaics."""
+    """Reorganize upstream jpgs into albedo/ (overlap-blended) + [input|albedo] mosaics.
+
+    Also writes <output_dir>/manifest.json recording the resize/crop transform so
+    phase-3 reconstruction can align each albedo frame back to the original RGB grid.
+    """
     gbuffer_root = os.path.join(save_folder, _GBUFFER_SUBDIR)
     if not os.path.isdir(gbuffer_root):
         raise FileNotFoundError(
             f"No {_GBUFFER_SUBDIR}/ produced under {save_folder}; upstream wrote nothing."
         )
     stride = max(1, args.num_frames - args.overlap_n_frames)
+    manifest: dict = {
+        "passes": args.passes,
+        "num_frames": args.num_frames,
+        "overlap_n_frames": args.overlap_n_frames,
+        "chunk_mode": args.chunk_mode,
+        "crop_height": args.height,
+        "crop_width": args.width,
+        "resize_resolution": args.resize_resolution,
+        "cameras": {},
+    }
     for camera in sorted(os.listdir(gbuffer_root)):
         camera_gbuffer = os.path.join(gbuffer_root, camera)
         if not os.path.isdir(camera_gbuffer):
@@ -112,36 +146,79 @@ def build_outputs(args: argparse.Namespace, save_folder: str) -> None:
         os.makedirs(albedo_dir, exist_ok=True)
         os.makedirs(mosaic_dir, exist_ok=True)
 
-        jpgs = sorted(f for f in os.listdir(camera_gbuffer) if f.endswith(".basecolor.jpg"))
-        n_mosaics = 0
-        for jpg in jpgs:
+        # Group every chunk's prediction by global frame index; overlap frames get >1.
+        contributions: dict[int, list[tuple[int, str]]] = defaultdict(list)
+        for jpg in (f for f in os.listdir(camera_gbuffer) if f.endswith(".basecolor.jpg")):
             global_index = _parse_jpg_global_index(jpg, stride)
             if global_index is None:
                 continue
-            albedo_path = os.path.join(camera_gbuffer, jpg)
-            shutil.copyfile(albedo_path, os.path.join(albedo_dir, f"{global_index:04d}.basecolor.jpg"))
+            idx_in_chunk = int(jpg.split(".")[1])
+            contributions[global_index].append((idx_in_chunk, os.path.join(camera_gbuffer, jpg)))
+
+        n_blended = 0
+        for global_index, contribs in sorted(contributions.items()):
+            if len(contribs) == 1:
+                albedo = np.asarray(Image.open(contribs[0][1]).convert("RGB"), dtype=np.uint8)
+            else:
+                albedo = _blend_chunk_frames(contribs, args.num_frames)
+                n_blended += 1
+            albedo_img = Image.fromarray(albedo, mode="RGB")
+            albedo_img.save(os.path.join(albedo_dir, f"{global_index:04d}.basecolor.jpg"), quality=95)
             input_png = os.path.join(args.input_root, camera, f"{global_index:04d}.png")
             if os.path.exists(input_png):
-                _write_mosaic(input_png, albedo_path, os.path.join(mosaic_dir, f"{global_index:04d}.png"))
-                n_mosaics += 1
-        print(f"  {camera}: {len(jpgs)} albedo frames, {n_mosaics} mosaics", flush=True)
+                _write_mosaic(input_png, albedo_img, os.path.join(mosaic_dir, f"{global_index:04d}.png"))
 
-        # Carry over the albedo mp4 if upstream produced one.
-        for f in os.listdir(save_folder):
-            if f.startswith(camera) and f.endswith(".basecolor.mp4"):
-                shutil.copyfile(os.path.join(save_folder, f), os.path.join(args.output_dir, camera, "albedo.mp4"))
+        native_hw = _native_resolution(os.path.join(args.input_root, camera))
+        manifest["cameras"][camera] = {
+            "num_albedo_frames": len(contributions),
+            "num_overlap_blended": n_blended,
+            "native_height": native_hw[0],
+            "native_width": native_hw[1],
+            "albedo_to_original": _alignment_transform(native_hw, args),
+        }
+        print(f"  {camera}: {len(contributions)} albedo frames ({n_blended} overlap-blended)", flush=True)
+
+    with open(os.path.join(args.output_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
-def _write_mosaic(input_png: str, albedo_jpg: str, out_png: str) -> None:
+def _native_resolution(input_camera_dir: str) -> tuple[int | None, int | None]:
+    """(height, width) of the first input PNG in a camera dir, or (None, None)."""
+    pngs = sorted(f for f in os.listdir(input_camera_dir) if f.endswith(".png")) \
+        if os.path.isdir(input_camera_dir) else []
+    if not pngs:
+        return None, None
+    with Image.open(os.path.join(input_camera_dir, pngs[0])) as im:
+        return im.height, im.width
+
+
+def _alignment_transform(native_hw: tuple[int | None, int | None], args: argparse.Namespace) -> dict | None:
+    """Map an albedo pixel (704x1280) back to the original RGB grid for phase 3.
+
+    Pipeline is: original (native) --resize--> resize_resolution --center-crop--> (H,W).
+    So original = (albedo + crop_offset) * (native / resize). Returns the offsets/scales.
+    """
+    native_h, native_w = native_hw
+    if native_h is None or args.resize_resolution is None:
+        return None
+    resize_h, resize_w = args.resize_resolution
+    return {
+        "crop_offset_y": (resize_h - args.height) // 2,
+        "crop_offset_x": (resize_w - args.width) // 2,
+        "scale_y": native_h / resize_h,
+        "scale_x": native_w / resize_w,
+    }
+
+
+def _write_mosaic(input_png: str, albedo_img: Image.Image, out_png: str) -> None:
     """Write a side-by-side [input | albedo] PNG, both scaled to a common height."""
     inp = Image.open(input_png).convert("RGB")
-    alb = Image.open(albedo_jpg).convert("RGB")
-    height = alb.height
+    height = albedo_img.height
     if inp.height != height:
         inp = inp.resize((round(inp.width * height / inp.height), height), Image.BILINEAR)
-    canvas = Image.new("RGB", (inp.width + alb.width, height))
+    canvas = Image.new("RGB", (inp.width + albedo_img.width, height))
     canvas.paste(inp, (0, 0))
-    canvas.paste(alb, (inp.width, 0))
+    canvas.paste(albedo_img, (inp.width, 0))
     canvas.save(out_png)
 
 
