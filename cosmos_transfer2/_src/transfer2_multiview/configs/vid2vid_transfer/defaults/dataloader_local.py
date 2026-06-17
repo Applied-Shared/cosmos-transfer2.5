@@ -302,6 +302,36 @@ def register_dataloader_local() -> None:
         ),
     )
 
+    # 7-view HDMap with WFM SDS short camera folder names. Override dataset_dir at train time.
+    SDS_FOLDER_TO_CAMERA = {
+        "front_wide": "camera_front_wide_120fov",
+        "front_tele": "camera_front_tele_30fov",
+        "cross_left": "camera_cross_left_120fov",
+        "cross_right": "camera_cross_right_120fov",
+        "rear": "camera_rear_tele_30fov",
+        "rear_left": "camera_rear_left_70fov",
+        "rear_right": "camera_rear_right_70fov",
+    }
+    dataset_sds = L(MultiviewTransferDataset)(
+        dataset_dir="/tmp/wfm_post_training_dataset",
+        augmentation_config=augmentation_config,
+        folder_to_camera_key=SDS_FOLDER_TO_CAMERA,
+    )
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="example_multiview_train_data_control_input_hdmap_sds",
+        node=L(get_generic_dataloader)(
+            dataset=dataset_sds,
+            sampler=L(get_sampler)(dataset=dataset_sds) if dist.is_initialized() else None,
+            collate_fn=collate_fn,
+            batch_size=1,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True,
+        ),
+    )
+
     # Agibot 3-view multicontrol (edge, depth, seg, vis)
     # num_video_frames must match model: tokenizer.get_pixel_num_frames(state_t) = (24-1)*4+1 = 93
     for ctrl_type in ("edge", "depth", "seg", "vis"):

@@ -1,0 +1,154 @@
+# WFM Post-Training — Lilypad Entrypoint
+
+Runs Cosmos Transfer 2.5 multiview HDMap post-training on Lilypad generic workloads.
+The workload config lives at `adp/services/wfm/lilypad_workload_configs/cosmos_transfer_post_training.yaml`
+in the applied3 repo.
+
+## Architecture
+
+Same Ray head/GPU-worker split as inference (`wfm_inference/lilypad_entrypoint.py`):
+
+- **Head node** — runs `lilypad_post_training_entrypoint.run()`.
+- **GPU worker** — downloads manifest, materializes dataset, runs `torchrun scripts.train`,
+  uploads checkpoints to OCI, converts final DCP to `model_ema_bf16.pt`.
+
+## Manual launch
+
+```bash
+export WANDB_API_KEY=<your api key>
+export AWS_ACCESS_KEY_ID=<oci-access-key>
+export AWS_SECRET_ACCESS_KEY=<oci-secret-key>
+
+lilypad workload launch adp/services/wfm/lilypad_workload_configs/cosmos_transfer_post_training.yaml
+```
+
+Get a W&B API key from https://appliedintuition.wandb.io/settings.
+
+## Manifest format (JSONL)
+
+Upload to OCI before launch (one sample per line):
+
+```json
+{"control_bundle_id":"<uuid>","segment_id":"<segment>","caption_id":"<caption>"}
+```
+
+Example key: `post_training/example-run-001/manifest.jsonl`
+
+Each line references three OCI sources:
+
+| Field | OCI path |
+|-------|----------|
+| `control_bundle_id` | `control_bundles/<id>/cameras/*/bbox.mp4` |
+| `segment_id` | `sds/<segment_id>/rgb/<short_name>.mp4` (7 cameras) |
+| `caption_id` | `sds/<segment_id>/captions/<caption_id>` (e.g. `v1.txt` for a caption version) |
+
+On-disk sample stem is `control_bundle_id`. Invalid samples (missing files or empty caption)
+are skipped with a warning; the job fails only if zero valid samples remain.
+
+## Materialized dataset layout
+
+Written to `/tmp/wfm_worker_cache/post_training/{training_run_id}/dataset/`:
+
+```
+dataset/
+├── videos/{short_name}/{control_bundle_id}.mp4
+├── control_input_hdmap_bbox/{short_name}/{control_bundle_id}.mp4
+└── captions/front_wide/{control_bundle_id}.json
+```
+
+Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wide`,
+`rear_left`, `rear_right`, `rear`.
+
+## Config keys
+
+| Key | Description |
+|-----|-------------|
+| `training_run_id` | Run id; used as `job.name` and W&B run name |
+| `manifest_bucket` / `manifest_key` | OCI location of JSONL manifest |
+| `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` |
+| `checkpoint_bucket` / `checkpoint_key` | Base model `.pt` cached locally (default: base) |
+| `hf_cache_bucket` / `hf_cache_prefix` | Pre-staged HuggingFace cache |
+| `experiment` | Hydra experiment (default: `transfer2_auto_multiview_post_train_example`) |
+| `data_train` | Hydra dataloader name (default: `example_multiview_train_data_control_input_hdmap_sds`) |
+| `max_iter` / `save_iter` | Training length and checkpoint frequency |
+| `resume_from_oci` | Download latest OCI checkpoint before training (default: false) |
+| `checkpoint_load_path` | Optional override for initial `checkpoint.load_path` |
+
+## Checkpoints and resume
+
+Training writes DCP checkpoints under:
+
+```
+/tmp/wfm_worker_cache/post_training/{training_run_id}/output/
+  cosmos_transfer_v2p5/auto_multiview/{training_run_id}/checkpoints/
+```
+
+(`IMAGINAIRE_OUTPUT_ROOT` is set to the `output/` directory above.)
+
+| Scenario | Behavior |
+|----------|----------|
+| Same pod retry | Resumes from local `latest_checkpoint.txt` if present |
+| New submission | Set `resume_from_oci: true` to pull latest iter from `output_prefix/checkpoints/` |
+| During training | Background watcher uploads each new iter to OCI |
+| On success | Converts latest DCP to `model_ema_bf16.pt` and uploads to `output_prefix/` |
+
+## W&B from a service (future)
+
+The workload YAML lists `WANDB_API_KEY` under `required_environment_variables`. When WFM
+submits this workload, `buildEnvVars` forwards keys from the WFM pod environment. Mount
+`WANDB_API_KEY` as a K8s secret on the WFM deployment (same pattern as OCI creds).
+
+## Upload local dataset to OCI
+
+Use `upload_local_dataset_to_oci.py` to transform a local ROG-layout dataset and upload
+manifest + SDS + control bundle objects:
+
+```bash
+python3 wfm_post_training/upload_local_dataset_to_oci.py \
+  --dataset-dir /path/to/rog102_v2 \
+  --run-id rog102-v2-test \
+  --max-samples 5 \
+  --caption-id v1.txt
+```
+
+`--caption-id` is the object name under `sds/<segment_id>/captions/` (default `v1.txt`).
+Use a new id (e.g. `v2.txt`) when uploading a revised caption for the same segment; point
+the manifest at the desired `caption_id` per sample.
+
+## Fake data for testing
+
+Before the SDS pipeline is live, seed minimal objects in `sensor-sim-wfm`:
+
+```
+sds/test-segment-001/rgb/front_wide.mp4       (+ 6 other short names)
+sds/test-segment-001/captions/cap-v1.txt
+control_bundles/<uuid>/cameras/FRONT_CENTER/bbox.mp4   (+ 6 other ROG camera dirs)
+post_training/test-run/manifest.jsonl
+```
+
+Manifest line:
+
+```json
+{"control_bundle_id":"<uuid>","segment_id":"test-segment-001","caption_id":"cap-v1.txt"}
+```
+
+Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to match.
+
+## Building and pushing the Docker image
+
+```bash
+cd /home/yun/cosmos-transfer2.5
+docker build -f Dockerfile \
+  --build-arg CUDA_NAME=cu128 \
+  --build-arg STANDALONE=true \
+  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.23 .
+
+docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.23
+```
+
+Then update `docker_image` in `cosmos_transfer_post_training.yaml`.
+
+## OCI S3-compat gotcha
+
+Same as inference — any boto3 client used against OCI must use payload signing and
+`when_required` checksum settings. See `wfm_inference/README.md`.
