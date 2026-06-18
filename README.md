@@ -1,3 +1,18 @@
+> [!IMPORTANT]
+> ## 🚀 [Cosmos 3 Has Arrived](https://github.com/NVIDIA/Cosmos)
+>
+> Cosmos 3 is NVIDIA's next-generation foundation model platform for Physical AI. Compared with Cosmos-Transfer2.5, Cosmos 3 delivers significantly stronger transfer capabilities, enabling higher-fidelity transformation, adaptation, and simulation across diverse domains, sensors, environments, and embodiments.
+>
+> Beyond improving transfer quality, Cosmos 3 unifies capabilities that previously required multiple specialized models. A single Cosmos 3 model can reason, predict future world states, transfer across domains and modalities, and generate actions and policies for embodied agents within one unified architecture.
+>
+> This repository is no longer under active development and will receive only limited maintenance updates. Future model releases, features, documentation, and community support will be focused on Cosmos 3.
+>
+> 👉 Visit the new Cosmos home: https://github.com/NVIDIA/Cosmos
+>
+> There you will find the latest Cosmos 3 models, technical reports, tutorials, benchmarks, and ecosystem updates.
+>
+> Thank you for your support of Cosmos-Transfer2.5. We encourage all users to migrate to Cosmos 3 for the latest state-of-the-art Physical AI capabilities.
+
 <p align="center">
     <img src="https://github.com/user-attachments/assets/28f2d612-bbd6-44a3-8795-833d05e9f05f" width="274" alt="NVIDIA Cosmos"/>
 </p>
@@ -11,6 +26,7 @@ NVIDIA Cosmos™ is a platform purpose-built for physical AI, featuring state-of
 Cosmos World Foundation Models come in three model types which can all be customized in post-training: [cosmos-predict](https://github.com/nvidia-cosmos/cosmos-predict2.5), [cosmos-transfer](https://github.com/nvidia-cosmos/cosmos-transfer2.5), and [cosmos-reason](https://github.com/nvidia-cosmos/cosmos-reason1).
 
 ## News
+* [June 1, 2026] [Cosmos 3](https://github.com/nvidia/cosmos) is live! We’re excited to share that Cosmos 3 has launched — NVIDIA’s next-generation family of open omnimodal world foundation models for Physical AI. As part of this launch, the Cosmos GitHub repositories have moved to the [main NVIDIA GitHub organization](https://github.com/nvidia/cosmos): [https://github.com/nvidia/cosmos](https://github.com/nvidia/cosmos). Cosmos 3 unifies language, images, video, audio, and actions in a single architecture, enabling developers to build agents that can understand, reason, simulate, and act in the physical world. Please use the new repository as the source of truth for the latest code, models, documentation, and updates.
 * [February 23, 2026] Released Transfer2.5 Distilled Edge [model](https://huggingface.co/nvidia/Cosmos-Transfer2.5-2B/tree/main/distilled/general/edge) and [inference](https://github.com/nvidia-cosmos/cosmos-transfer2.5/blob/main/docs/inference.md), enabling low latency (edge deployment) inference. More distilled controlnets coming soon.
 * [December 19, 2025] Released Image2Image and ImagePrompt capabilities. See the inference guide [here](docs/inference_image.md).
 * [December 12, 2025] Released updated checkpoints for [Cosmos-Transfer2.5-2B](https://huggingface.co/nvidia/Cosmos-Transfer2.5-2B) (blur, depth, segmentation, edge), fixed an issue with autoregressive multiview when num_conditional_frames == 0, optimized control video rendering, refreshed documentation, and added a new post-training example for [single-view](docs/post-training_singleview.md) edge/depth/seg/blur modalities.

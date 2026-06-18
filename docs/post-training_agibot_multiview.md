@@ -1,5 +1,10 @@
 # Agibot Multiview Post-training
 
+> **⚠️ Note**
+> The model and features described in this document are currently **internal-only** and are not publicly accessible. This includes all referenced checkpoints (e.g., `Cosmos-Transfer2.5-2B/robot-multiview-control`).
+>
+> As a result, the instructions in this guide cannot be executed outside of NVIDIA at this time. We may make these models available in the future. This document will be updated accordingly if that changes.
+
 This guide covers post-training the Cosmos-Transfer2.5 Agibot 3-view control models (head_color, hand_left, hand_right) with edge, depth, seg, or vis control using your own local data.
 
 ## Table of Contents

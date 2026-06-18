@@ -1,5 +1,10 @@
 # Robot Multiview Control-Conditioned Inference
 
+> **⚠️ Note**
+> The model and features described in this document are currently **internal-only** and are not publicly accessible. This includes all referenced checkpoints (e.g., `Cosmos-Transfer2.5-2B/robot-multiview-control`).
+>
+> As a result, the instructions in this guide cannot be executed outside of NVIDIA at this time. We may make these models available in the future. This document will be updated accordingly if that changes.
+
 We recommend first reading the [Inference Guide](inference.md).
 This guide covers control-conditioned video generation for robot multiview scenarios, specifically for the Agibot dataset with 3-camera views (head, left hand, right hand).
 
