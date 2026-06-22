@@ -931,8 +931,18 @@ class ClipGTLoader(SceneDataLoader):
                     )
 
     def _load_traffic_lights(self, scene_data: SceneData, traffic_light_file: Path) -> None:
-        """Load traffic lights."""
+        """Load traffic lights, carrying each signal's color onto the light.
+
+        The parquet ``state`` column holds one representative color per signal
+        (e.g. "RED"/"YELLOW"/"GREEN"). It is broadcast across all frames via
+        ``metadata["state_sequence"]`` so the renderer colors the light; an
+        absent/empty state leaves the light UNKNOWN (gray). Orientation is
+        optional: a missing or null quaternion falls back to identity instead
+        of raising.
+        """
         df = pd.read_parquet(traffic_light_file)
+
+        num_frames = max(1, scene_data.num_frames)
 
         for idx, row in df.iterrows():
             light = cast(Dict[str, Any], row["traffic_light"])
@@ -948,15 +958,16 @@ class ClipGTLoader(SceneDataLoader):
                 if all(dims[k] is not None for k in ["x", "y", "z"]):
                     dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
 
-            orientation = np.array(
-                [
-                    light["orientation"]["x"],
-                    light["orientation"]["y"],
-                    light["orientation"]["z"],
-                    light["orientation"]["w"],
-                ],
-                dtype=np.float32,
-            )
+            # Orientation is optional: a missing or null quaternion (e.g. signals
+            # from sources that record no facing) defaults to identity.
+            orient = light["orientation"] if "orientation" in light else None
+            if orient is None or any(orient[k] is None for k in ("x", "y", "z", "w")):
+                orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                orientation = np.array(
+                    [orient["x"], orient["y"], orient["z"], orient["w"]],
+                    dtype=np.float32,
+                )
 
             if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
                 continue
@@ -964,14 +975,21 @@ class ClipGTLoader(SceneDataLoader):
             center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
             orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
 
-            scene_data.traffic_lights.append(
-                TrafficLight(
-                    element_id=f"traffic_light_{idx}",
-                    center=center,
-                    dimensions=dimensions,
-                    orientation=orientation,
-                )
+            traffic_light = TrafficLight(
+                element_id=f"traffic_light_{idx}",
+                center=center,
+                dimensions=dimensions,
+                orientation=orientation,
             )
+
+            # Carry the representative color onto the light. The renderer reads a
+            # per-frame sequence and pads (does not broadcast) a short one, so emit
+            # one entry per frame. An absent/empty state stays UNKNOWN (gray).
+            state = light["state"] if "state" in light else None
+            if isinstance(state, str) and state.strip():
+                traffic_light.metadata["state_sequence"] = [state] * num_frames
+
+            scene_data.traffic_lights.append(traffic_light)
 
     def _load_traffic_signs(self, scene_data: SceneData, traffic_sign_file: Path) -> None:
         """Load traffic signs."""
