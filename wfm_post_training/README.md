@@ -55,8 +55,6 @@ Upload to OCI before launch (one sample per line):
 {"control_bundle_id":"<uuid>","segment_id":"<segment>","caption_version":"<caption>"}
 ```
 
-(`caption_id` is accepted as a deprecated alias.)
-
 Example key: `post_training/example-run-001/manifest.jsonl`
 
 Each line references three OCI sources (legacy `sds/` layout):

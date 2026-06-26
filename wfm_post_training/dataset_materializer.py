@@ -123,7 +123,7 @@ def parse_manifest_line(line: str, line_num: int) -> ManifestEntry | None:
     for field in ("control_bundle_id", "segment_id"):
         if not data.get(field):
             raise ValueError(f"manifest line {line_num}: missing required field {field!r}")
-    caption_version = data.get("caption_version") or data.get("caption_id")
+    caption_version = data.get("caption_version")
     if not caption_version:
         raise ValueError(
             f"manifest line {line_num}: missing required field 'caption_version'"
