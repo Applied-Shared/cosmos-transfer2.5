@@ -281,9 +281,14 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
     manifest_key = (config.get("manifest_key") or "").strip()
 
     if flyte_job_id:
-        caption_version = (config.get("caption_version") or "").strip()
+        caption_version = (
+            config.get("caption_version") or config.get("caption_id") or ""
+        ).strip()
         if not caption_version:
-            raise ValueError("caption_version is required when flyte_job_id is set")
+            raise ValueError(
+                "caption_version (or deprecated caption_id) is required when "
+                "flyte_job_id is set"
+            )
         worker_logger.info(
             "Downloading finetuning mapping s3://%s/finetuning_jobs/%s/"
             "segment_annotation_control_bundle.txt",
