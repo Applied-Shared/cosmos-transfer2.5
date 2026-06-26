@@ -28,7 +28,7 @@ Get a W&B API key from https://appliedintuition.wandb.io/settings.
 
 ### Finetuning mapping (recommended)
 
-When `flyte_job_id` and `caption_id` are set in the workload config, the entrypoint
+When `flyte_job_id` and `caption_version` are set in the workload config, the entrypoint
 reads:
 
 ```
@@ -43,17 +43,19 @@ OCI sources resolved per sample (WFM canonical layout):
 |-------|----------|
 | `control_bundle_id` | `control_bundles/<id>/controls/<short_name>.mp4` (via spec.json) |
 | `segment_id` | `rgb/<segment_id>/<short_name>.mp4` (7 cameras) |
-| `caption_id` | `captions/<segment_id>/front_wide/<caption_id>.json` |
+| `caption_version` | `captions/<segment_id>/front_wide/<caption_version>.json` |
 
-Example `caption_id`: `cosmos-reason2-2b_prompts-v1`
+Example `caption_version`: `cosmos-reason2-2b_prompts-v1`
 
 ### Legacy JSONL manifest
 
 Upload to OCI before launch (one sample per line):
 
 ```json
-{"control_bundle_id":"<uuid>","segment_id":"<segment>","caption_id":"<caption>"}
+{"control_bundle_id":"<uuid>","segment_id":"<segment>","caption_version":"<caption>"}
 ```
+
+(`caption_id` is accepted as a deprecated alias.)
 
 Example key: `post_training/example-run-001/manifest.jsonl`
 
@@ -63,7 +65,7 @@ Each line references three OCI sources (legacy `sds/` layout):
 |-------|----------|
 | `control_bundle_id` | `control_bundles/<id>/cameras/*/bbox.mp4` |
 | `segment_id` | `sds/<segment_id>/rgb/<short_name>.mp4` (7 cameras) |
-| `caption_id` | `sds/<segment_id>/captions/<caption_id>` (e.g. `v1.txt`) |
+| `caption_version` | `sds/<segment_id>/captions/<caption_version>` (e.g. `v1.txt`) |
 
 On-disk sample stem is `control_bundle_id`. Invalid samples (missing files or empty caption)
 are skipped with a warning; the job fails only if zero valid samples remain.
@@ -89,7 +91,7 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 | `training_run_id` | Run id; used as `job.name` and W&B run name |
 | `manifest_bucket` | OCI bucket for training inputs |
 | `flyte_job_id` | Finetuning run id; reads `finetuning_jobs/<id>/segment_annotation_control_bundle.txt` |
-| `caption_id` | Caption version filename (required with `flyte_job_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
+| `caption_version` | Caption version filename (required with `flyte_job_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
 | `manifest_key` | Legacy JSONL manifest key (use when `flyte_job_id` is unset) |
 | `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` |
 | `checkpoint_bucket` / `checkpoint_key` | Base model `.pt` cached locally (default: base) |
@@ -134,12 +136,12 @@ python3 wfm_post_training/upload_local_dataset_to_oci.py \
   --dataset-dir /path/to/rog102_v2 \
   --run-id rog102-v2-test \
   --max-samples 5 \
-  --caption-id v1.txt
+  --caption-version v1.txt
 ```
 
-`--caption-id` is the object name under `sds/<segment_id>/captions/` (default `v1.txt`).
-Use a new id (e.g. `v2.txt`) when uploading a revised caption for the same segment; point
-the manifest at the desired `caption_id` per sample.
+`--caption-version` is the object name under `sds/<segment_id>/captions/` (default `v1.txt`).
+Use a new version (e.g. `v2.txt`) when uploading a revised caption for the same segment; point
+the manifest at the desired `caption_version` per sample.
 
 ## Fake data for testing
 
@@ -155,7 +157,7 @@ post_training/test-run/manifest.jsonl
 Manifest line:
 
 ```json
-{"control_bundle_id":"<uuid>","segment_id":"test-segment-001","caption_id":"cap-v1.txt"}
+{"control_bundle_id":"<uuid>","segment_id":"test-segment-001","caption_version":"cap-v1.txt"}
 ```
 
 Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to match.

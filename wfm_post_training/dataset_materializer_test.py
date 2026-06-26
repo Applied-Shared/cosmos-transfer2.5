@@ -60,7 +60,7 @@ class FinetuningMappingHelpersTest(unittest.TestCase):
         self.assertEqual(1, len(entries))
         self.assertEqual("cb-1", entries[0].control_bundle_id)
         self.assertEqual("seg-a", entries[0].segment_id)
-        self.assertEqual("cosmos-reason2-2b_prompts-v1", entries[0].caption_id)
+        self.assertEqual("cosmos-reason2-2b_prompts-v1", entries[0].caption_version)
 
 
 class OciPathHelpersTest(unittest.TestCase):

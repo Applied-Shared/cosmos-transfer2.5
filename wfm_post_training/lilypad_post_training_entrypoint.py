@@ -281,9 +281,9 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
     manifest_key = (config.get("manifest_key") or "").strip()
 
     if flyte_job_id:
-        caption_id = (config.get("caption_id") or "").strip()
-        if not caption_id:
-            raise ValueError("caption_id is required when flyte_job_id is set")
+        caption_version = (config.get("caption_version") or "").strip()
+        if not caption_version:
+            raise ValueError("caption_version is required when flyte_job_id is set")
         worker_logger.info(
             "Downloading finetuning mapping s3://%s/finetuning_jobs/%s/"
             "segment_annotation_control_bundle.txt",
@@ -295,11 +295,11 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
             manifest_bucket,
             flyte_job_id,
         )
-        entries = finetuning_mapping_to_manifest_entries(mapping_entries, caption_id)
+        entries = finetuning_mapping_to_manifest_entries(mapping_entries, caption_version)
         worker_logger.info(
-            "Finetuning mapping contains %d entries (caption_id=%s)",
+            "Finetuning mapping contains %d entries (caption_version=%s)",
             len(entries),
-            caption_id,
+            caption_version,
         )
         return entries, False
 
@@ -449,7 +449,7 @@ def run(config: dict) -> None:
         hf_cache_prefix:      prefix under hf_cache_bucket
 
     Input manifest — provide either:
-        flyte_job_id + caption_id: reads finetuning_jobs/<flyte_job_id>/
+        flyte_job_id + caption_version: reads finetuning_jobs/<flyte_job_id>/
             segment_annotation_control_bundle.txt and WFM canonical OCI paths
         manifest_key: legacy JSONL manifest at manifest_bucket/manifest_key
 

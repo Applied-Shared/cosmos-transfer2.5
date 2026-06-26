@@ -33,7 +33,7 @@ SDS_PREFIX = "sds"
 class ManifestEntry:
     control_bundle_id: str
     segment_id: str
-    caption_id: str
+    caption_version: str
 
 
 @dataclass(frozen=True)
@@ -99,14 +99,14 @@ def download_finetuning_mapping(
 
 def finetuning_mapping_to_manifest_entries(
     mapping_entries: list[FinetuningMappingEntry],
-    caption_id: str,
+    caption_version: str,
 ) -> list[ManifestEntry]:
     """Convert finetuning mapping lines to ManifestEntry for materialization."""
     return [
         ManifestEntry(
             control_bundle_id=entry.control_bundle_id,
             segment_id=entry.segment_id,
-            caption_id=caption_id,
+            caption_version=caption_version,
         )
         for entry in mapping_entries
     ]
@@ -118,13 +118,18 @@ def parse_manifest_line(line: str, line_num: int) -> ManifestEntry | None:
     if not stripped:
         return None
     data = json.loads(stripped)
-    for field in ("control_bundle_id", "segment_id", "caption_id"):
+    for field in ("control_bundle_id", "segment_id"):
         if not data.get(field):
             raise ValueError(f"manifest line {line_num}: missing required field {field!r}")
+    caption_version = data.get("caption_version") or data.get("caption_id")
+    if not caption_version:
+        raise ValueError(
+            f"manifest line {line_num}: missing required field 'caption_version'"
+        )
     return ManifestEntry(
         control_bundle_id=str(data["control_bundle_id"]),
         segment_id=str(data["segment_id"]),
-        caption_id=str(data["caption_id"]),
+        caption_version=str(caption_version),
     )
 
 
@@ -220,13 +225,13 @@ def _rgb_key(segment_id: str, short_name: str, *, use_legacy_sds_paths: bool) ->
 
 def _caption_key(
     segment_id: str,
-    caption_id: str,
+    caption_version: str,
     *,
     use_legacy_sds_paths: bool,
 ) -> str:
     if use_legacy_sds_paths:
-        return f"{SDS_PREFIX}/{segment_id}/captions/{caption_id}"
-    return f"{CAPTIONS_PREFIX}/{segment_id}/{CAPTION_FOLDER}/{caption_id}.json"
+        return f"{SDS_PREFIX}/{segment_id}/captions/{caption_version}"
+    return f"{CAPTIONS_PREFIX}/{segment_id}/{CAPTION_FOLDER}/{caption_version}.json"
 
 
 def _read_caption_text(caption_path: Path, *, use_legacy_sds_paths: bool) -> str:
@@ -264,7 +269,7 @@ def _materialize_sample(
 
     caption_key = _caption_key(
         entry.segment_id,
-        entry.caption_id,
+        entry.caption_version,
         use_legacy_sds_paths=use_legacy_sds_paths,
     )
     if not object_exists(client, bucket, caption_key):

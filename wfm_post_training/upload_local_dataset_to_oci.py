@@ -55,13 +55,18 @@ def main() -> None:
     parser.add_argument("--run-id", default="rog102-v2-test")
     parser.add_argument("--max-samples", type=int, default=0, help="0 = all samples")
     parser.add_argument(
-        "--caption-id",
+        "--caption-version",
         default="v1.txt",
         help=(
             "Caption object name under sds/<segment_id>/captions/. "
             "Use a version label (e.g. v1.txt, v2.txt) so multiple caption "
             "generations can coexist for the same segment."
         ),
+    )
+    parser.add_argument(
+        "--caption-id",
+        dest="caption_version",
+        help="Deprecated alias for --caption-version.",
     )
     args = parser.parse_args()
 
@@ -80,13 +85,13 @@ def main() -> None:
         raise RuntimeError(f"No samples found under {front_center}")
 
     print(f"Uploading {len(samples)} sample(s) to s3://{args.bucket}/")
-    print(f"Caption id: {args.caption_id}")
+    print(f"Caption version: {args.caption_version}")
 
     for i, segment_id in enumerate(samples, 1):
         # For manual testing, control_bundle_id matches segment_id.
         control_bundle_id = segment_id
-        caption_id = args.caption_id
-        print(f"[{i}/{len(samples)}] segment_id={segment_id} caption_id={caption_id}")
+        caption_version = args.caption_version
+        print(f"[{i}/{len(samples)}] segment_id={segment_id} caption_version={caption_version}")
 
         for rog, short in ROG_TO_SHORT.items():
             rgb_local = dataset / "videos" / rog / f"{segment_id}.mp4"
@@ -100,9 +105,9 @@ def main() -> None:
         caption_text = json.loads(caption_json.read_text(encoding="utf-8"))["caption"].strip()
         if not caption_text:
             raise ValueError(f"Empty caption in {caption_json}")
-        caption_tmp = Path(f"/tmp/caption_{segment_id}_{caption_id.replace('/', '_')}")
+        caption_tmp = Path(f"/tmp/caption_{segment_id}_{caption_version.replace('/', '_')}")
         caption_tmp.write_text(caption_text + "\n", encoding="utf-8")
-        upload_file(client, args.bucket, f"sds/{segment_id}/captions/{caption_id}", caption_tmp)
+        upload_file(client, args.bucket, f"sds/{segment_id}/captions/{caption_version}", caption_tmp)
 
         spec: dict[str, object] = {"name": "multiview"}
         for rog in ROG_CAMERAS:
@@ -132,7 +137,7 @@ def main() -> None:
                 {
                     "control_bundle_id": control_bundle_id,
                     "segment_id": segment_id,
-                    "caption_id": caption_id,
+                    "caption_version": caption_version,
                 }
             )
         )
