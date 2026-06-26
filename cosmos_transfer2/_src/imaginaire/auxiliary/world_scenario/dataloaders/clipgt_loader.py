@@ -955,7 +955,7 @@ class ClipGTLoader(SceneDataLoader):
             dimensions = np.array([0.6, 0.6, 1.0], dtype=np.float32)  # Default
             if "dimensions" in light:
                 dims = light["dimensions"]
-                if all(dims[k] is not None for k in ["x", "y", "z"]):
+                if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
                     dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
 
             # Orientation is optional: a missing or null quaternion (e.g. signals
@@ -1006,7 +1006,7 @@ class ClipGTLoader(SceneDataLoader):
             dimensions = np.array([0.8, 0.3, 0.8], dtype=np.float32)  # Default
             if "dimensions" in sign:
                 dims = sign["dimensions"]
-                if all(dims[k] is not None for k in ["x", "y", "z"]):
+                if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
                     dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
 
             orientation = np.array(

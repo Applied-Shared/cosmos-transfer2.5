@@ -98,3 +98,18 @@ def test_should_default_to_identity_when_orientation_component_null(monkeypatch)
     # Postcondition.
     assert len(scene.traffic_lights) == 1
     assert np.isfinite(scene.traffic_lights[0].orientation).all()
+
+
+def test_should_default_dimensions_when_dimensions_null(monkeypatch):
+    # Precondition. The parquet always carries a "dimensions" column, but
+    # sim-bag-sourced lights leave its value null; the key is present, value None.
+    scene = _scene_with_frames(2)
+    rows = [{"center": _CENTER, "orientation": _IDENTITY, "state": "RED", "dimensions": None}]
+
+    # Under test.
+    _load(monkeypatch, scene, rows)
+
+    # Postcondition. Falls back to the default box (no crash) and still colors the light.
+    assert len(scene.traffic_lights) == 1
+    np.testing.assert_array_equal(scene.traffic_lights[0].dimensions, [0.6, 0.6, 1.0])
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 2
