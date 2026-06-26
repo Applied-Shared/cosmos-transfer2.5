@@ -88,12 +88,12 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 
 | Key | Description |
 |-----|-------------|
-| `training_run_id` | Run id; used as `job.name` and W&B run name |
+| `training_run_id` | `finetuning_runs.uuid` for this Lilypad submission; used as `job.name`, W&B run name, and local cache dir |
 | `manifest_bucket` | OCI bucket for training inputs |
-| `flyte_job_id` | Finetuning run id; reads `finetuning_jobs/<id>/segment_annotation_control_bundle.txt` |
+| `flyte_job_id` | Flyte campaign id; reads `finetuning_jobs/<flyte_job_id>/segment_annotation_control_bundle.txt` |
 | `caption_version` | Caption version filename (required with `flyte_job_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
 | `manifest_key` | Legacy JSONL manifest key (use when `flyte_job_id` is unset) |
-| `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` |
+| `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` (`finetuning_jobs/<finetuning_run_id>/` when submitted via WFM) |
 | `checkpoint_bucket` / `checkpoint_key` | Base model `.pt` cached locally (default: base) |
 | `hf_cache_bucket` / `hf_cache_prefix` | Pre-staged HuggingFace cache |
 | `experiment` | Hydra experiment (default: `transfer2_auto_multiview_post_train_example`) |
