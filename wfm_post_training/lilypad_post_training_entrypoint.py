@@ -11,7 +11,12 @@ from pathlib import Path
 import ray
 from lilypad.public.sdk_py.cached_file_access.boto import get_readonly_boto_client
 
-from wfm_post_training.dataset_materializer import download_manifest, materialize_dataset
+from wfm_post_training.dataset_materializer import (
+    download_finetuning_mapping,
+    download_manifest,
+    finetuning_mapping_to_manifest_entries,
+    materialize_dataset,
+)
 from wfm_post_training.oci_helpers import (
     WORKER_CACHE_DIR,
     download_checkpoint,
@@ -269,6 +274,48 @@ def _convert_and_upload_final_checkpoint(
             upload_file(plain_client, local_path, output_bucket, key)
 
 
+def _load_training_entries(config: dict, plain_client, worker_logger: logging.Logger):
+    """Load manifest entries from finetuning mapping or legacy JSONL manifest."""
+    manifest_bucket = config["manifest_bucket"]
+    flyte_job_id = (config.get("flyte_job_id") or "").strip()
+    manifest_key = (config.get("manifest_key") or "").strip()
+
+    if flyte_job_id:
+        caption_id = (config.get("caption_id") or "").strip()
+        if not caption_id:
+            raise ValueError("caption_id is required when flyte_job_id is set")
+        worker_logger.info(
+            "Downloading finetuning mapping s3://%s/finetuning_jobs/%s/"
+            "segment_annotation_control_bundle.txt",
+            manifest_bucket,
+            flyte_job_id,
+        )
+        mapping_entries = download_finetuning_mapping(
+            plain_client,
+            manifest_bucket,
+            flyte_job_id,
+        )
+        entries = finetuning_mapping_to_manifest_entries(mapping_entries, caption_id)
+        worker_logger.info(
+            "Finetuning mapping contains %d entries (caption_id=%s)",
+            len(entries),
+            caption_id,
+        )
+        return entries, False
+
+    if not manifest_key:
+        raise ValueError("either flyte_job_id or manifest_key is required")
+
+    worker_logger.info(
+        "Downloading legacy manifest s3://%s/%s",
+        manifest_bucket,
+        manifest_key,
+    )
+    entries = download_manifest(plain_client, manifest_bucket, manifest_key)
+    worker_logger.info("Manifest contains %d entries", len(entries))
+    return entries, True
+
+
 @ray.remote
 def _run_post_training_on_gpu(config: dict) -> None:
     """Runs on the GPU worker: materialize dataset, train, upload checkpoints."""
@@ -279,8 +326,6 @@ def _run_post_training_on_gpu(config: dict) -> None:
     cached_client = get_readonly_boto_client()
 
     training_run_id = config["training_run_id"]
-    manifest_bucket = config["manifest_bucket"]
-    manifest_key = config["manifest_key"]
     output_bucket = config["output_bucket"]
     output_prefix = config["output_prefix"]
 
@@ -312,14 +357,14 @@ def _run_post_training_on_gpu(config: dict) -> None:
             worker_logger,
         )
 
-    worker_logger.info(
-        "Downloading manifest s3://%s/%s",
-        manifest_bucket,
-        manifest_key,
+    entries, use_legacy_sds_paths = _load_training_entries(config, plain_client, worker_logger)
+    materialize_dataset(
+        plain_client,
+        config["manifest_bucket"],
+        entries,
+        dataset_dir,
+        use_legacy_sds_paths=use_legacy_sds_paths,
     )
-    entries = download_manifest(plain_client, manifest_bucket, manifest_key)
-    worker_logger.info("Manifest contains %d entries", len(entries))
-    materialize_dataset(plain_client, manifest_bucket, entries, dataset_dir)
 
     resume_path: Path | None = None
     if config.get("resume_from_oci"):
@@ -397,12 +442,16 @@ def run(config: dict) -> None:
 
     Required config keys:
         training_run_id:    unique run id; used as job.name and W&B run name
-        manifest_bucket:    OCI bucket containing the JSONL manifest
-        manifest_key:         object key for manifest.jsonl
+        manifest_bucket:    OCI bucket containing training inputs
         output_bucket:        OCI bucket for checkpoints and final .pt uploads
         output_prefix:        prefix under output_bucket (e.g. post_training/run-001)
         hf_cache_bucket:      OCI bucket with pre-staged HF model cache
         hf_cache_prefix:      prefix under hf_cache_bucket
+
+    Input manifest — provide either:
+        flyte_job_id + caption_id: reads finetuning_jobs/<flyte_job_id>/
+            segment_annotation_control_bundle.txt and WFM canonical OCI paths
+        manifest_key: legacy JSONL manifest at manifest_bucket/manifest_key
 
     Optional config keys:
         checkpoint_bucket / checkpoint_key: base model .pt to cache locally (default base)

@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CONTROL_BUNDLE_PREFIX = "control_bundles"
+RGB_PREFIX = "rgb"
+CAPTIONS_PREFIX = "captions"
+FINETUNING_JOBS_PREFIX = "finetuning_jobs"
+# Legacy layout prefix; used only when use_legacy_sds_paths is True.
 SDS_PREFIX = "sds"
 
 
@@ -33,10 +37,79 @@ class ManifestEntry:
 
 
 @dataclass(frozen=True)
+class FinetuningMappingEntry:
+    segment_id: str
+    annotation_hash: str
+    control_bundle_id: str
+
+
+@dataclass(frozen=True)
 class MaterializeResult:
     dataset_dir: Path
     valid_count: int
     skipped_count: int
+
+
+def parse_finetuning_mapping_line(line: str, line_num: int) -> FinetuningMappingEntry | None:
+    """Parse one segment_annotation_control_bundle.txt line; return None for blank lines."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) != 3:
+        raise ValueError(
+            f"mapping line {line_num}: expected 3 fields "
+            f"(segment_id annotation_hash control_bundle_id), got {len(parts)}"
+        )
+    return FinetuningMappingEntry(
+        segment_id=parts[0],
+        annotation_hash=parts[1],
+        control_bundle_id=parts[2],
+    )
+
+
+def load_finetuning_mapping(mapping_text: str) -> list[FinetuningMappingEntry]:
+    """Parse a full segment_annotation_control_bundle.txt string into entries."""
+    entries: list[FinetuningMappingEntry] = []
+    for line_num, line in enumerate(mapping_text.splitlines(), start=1):
+        entry = parse_finetuning_mapping_line(line, line_num)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def finetuning_mapping_key(flyte_job_id: str) -> str:
+    """Return the OCI key for a finetuning run's segment-to-bundle mapping file."""
+    return (
+        f"{FINETUNING_JOBS_PREFIX}/{flyte_job_id}/segment_annotation_control_bundle.txt"
+    )
+
+
+def download_finetuning_mapping(
+    client: "boto3.client",
+    bucket: str,
+    flyte_job_id: str,
+) -> list[FinetuningMappingEntry]:
+    """Download and parse segment_annotation_control_bundle.txt from OCI."""
+    key = finetuning_mapping_key(flyte_job_id)
+    with tempfile.NamedTemporaryFile(mode="w+b", suffix=".txt") as tmp:
+        client.download_file(bucket, key, tmp.name)
+        return load_finetuning_mapping(Path(tmp.name).read_text(encoding="utf-8"))
+
+
+def finetuning_mapping_to_manifest_entries(
+    mapping_entries: list[FinetuningMappingEntry],
+    caption_id: str,
+) -> list[ManifestEntry]:
+    """Convert finetuning mapping lines to ManifestEntry for materialization."""
+    return [
+        ManifestEntry(
+            control_bundle_id=entry.control_bundle_id,
+            segment_id=entry.segment_id,
+            caption_id=caption_id,
+        )
+        for entry in mapping_entries
+    ]
 
 
 def parse_manifest_line(line: str, line_num: int) -> ManifestEntry | None:
@@ -139,11 +212,42 @@ def _resolve_control_paths(
     return _control_paths_from_listing(client, bucket, bundle_id)
 
 
+def _rgb_key(segment_id: str, short_name: str, *, use_legacy_sds_paths: bool) -> str:
+    if use_legacy_sds_paths:
+        return f"{SDS_PREFIX}/{segment_id}/rgb/{short_name}.mp4"
+    return f"{RGB_PREFIX}/{segment_id}/{short_name}.mp4"
+
+
+def _caption_key(
+    segment_id: str,
+    caption_id: str,
+    *,
+    use_legacy_sds_paths: bool,
+) -> str:
+    if use_legacy_sds_paths:
+        return f"{SDS_PREFIX}/{segment_id}/captions/{caption_id}"
+    return f"{CAPTIONS_PREFIX}/{segment_id}/{CAPTION_FOLDER}/{caption_id}.json"
+
+
+def _read_caption_text(caption_path: Path, *, use_legacy_sds_paths: bool) -> str:
+    raw = caption_path.read_text(encoding="utf-8").strip()
+    if not raw:
+        return ""
+    if use_legacy_sds_paths:
+        return raw
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        return str(data.get("caption", "")).strip()
+    return raw
+
+
 def _materialize_sample(
     client: "boto3.client",
     bucket: str,
     entry: ManifestEntry,
     dataset_dir: Path,
+    *,
+    use_legacy_sds_paths: bool = False,
 ) -> bool:
     """Download and layout one sample. Returns True on success."""
     sample_id = entry.control_bundle_id
@@ -152,13 +256,17 @@ def _materialize_sample(
     missing: list[str] = []
     for short_name in SDS_CAMERA_SHORT_NAMES:
         control_key = control_paths.get(short_name)
-        rgb_key = f"{SDS_PREFIX}/{entry.segment_id}/rgb/{short_name}.mp4"
+        rgb_key = _rgb_key(entry.segment_id, short_name, use_legacy_sds_paths=use_legacy_sds_paths)
         if control_key is None or not object_exists(client, bucket, control_key):
             missing.append(f"control/{short_name}")
         elif not object_exists(client, bucket, rgb_key):
             missing.append(f"rgb/{short_name}")
 
-    caption_key = f"{SDS_PREFIX}/{entry.segment_id}/captions/{entry.caption_id}"
+    caption_key = _caption_key(
+        entry.segment_id,
+        entry.caption_id,
+        use_legacy_sds_paths=use_legacy_sds_paths,
+    )
     if not object_exists(client, bucket, caption_key):
         missing.append("caption")
 
@@ -173,7 +281,10 @@ def _materialize_sample(
 
     with tempfile.NamedTemporaryFile(mode="w+b", suffix=".txt") as caption_tmp:
         client.download_file(bucket, caption_key, caption_tmp.name)
-        caption_text = Path(caption_tmp.name).read_text(encoding="utf-8").strip()
+        caption_text = _read_caption_text(
+            Path(caption_tmp.name),
+            use_legacy_sds_paths=use_legacy_sds_paths,
+        )
     if not caption_text:
         logger.warning(
             "Skipping sample control_bundle_id=%s: empty caption at s3://%s/%s",
@@ -190,7 +301,7 @@ def _materialize_sample(
         download_file(
             client,
             bucket,
-            f"{SDS_PREFIX}/{entry.segment_id}/rgb/{short_name}.mp4",
+            _rgb_key(entry.segment_id, short_name, use_legacy_sds_paths=use_legacy_sds_paths),
             rgb_dest,
         )
 
@@ -208,6 +319,8 @@ def materialize_dataset(
     bucket: str,
     entries: list[ManifestEntry],
     dataset_dir: Path,
+    *,
+    use_legacy_sds_paths: bool = False,
 ) -> MaterializeResult:
     """Materialize all manifest entries into dataset_dir."""
     for subdir in ("videos", "control_input_hdmap_bbox", "captions"):
@@ -226,7 +339,13 @@ def materialize_dataset(
             len(entries),
             entry.control_bundle_id,
         )
-        if _materialize_sample(client, bucket, entry, dataset_dir):
+        if _materialize_sample(
+            client,
+            bucket,
+            entry,
+            dataset_dir,
+            use_legacy_sds_paths=use_legacy_sds_paths,
+        ):
             valid += 1
         else:
             skipped += 1

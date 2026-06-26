@@ -24,7 +24,30 @@ lilypad workload launch adp/services/wfm/lilypad_workload_configs/cosmos_transfe
 
 Get a W&B API key from https://appliedintuition.wandb.io/settings.
 
-## Manifest format (JSONL)
+## Manifest format
+
+### Finetuning mapping (recommended)
+
+When `flyte_job_id` and `caption_id` are set in the workload config, the entrypoint
+reads:
+
+```
+finetuning_jobs/<flyte_job_id>/segment_annotation_control_bundle.txt
+```
+
+Each non-empty line: `<segment_id> <annotation_hash> <control_bundle_id>`
+
+OCI sources resolved per sample (WFM canonical layout):
+
+| Field | OCI path |
+|-------|----------|
+| `control_bundle_id` | `control_bundles/<id>/controls/<short_name>.mp4` (via spec.json) |
+| `segment_id` | `rgb/<segment_id>/<short_name>.mp4` (7 cameras) |
+| `caption_id` | `captions/<segment_id>/front_wide/<caption_id>.json` |
+
+Example `caption_id`: `cosmos-reason2-2b_prompts-v1`
+
+### Legacy JSONL manifest
 
 Upload to OCI before launch (one sample per line):
 
@@ -34,13 +57,13 @@ Upload to OCI before launch (one sample per line):
 
 Example key: `post_training/example-run-001/manifest.jsonl`
 
-Each line references three OCI sources:
+Each line references three OCI sources (legacy `sds/` layout):
 
 | Field | OCI path |
 |-------|----------|
 | `control_bundle_id` | `control_bundles/<id>/cameras/*/bbox.mp4` |
 | `segment_id` | `sds/<segment_id>/rgb/<short_name>.mp4` (7 cameras) |
-| `caption_id` | `sds/<segment_id>/captions/<caption_id>` (e.g. `v1.txt` for a caption version) |
+| `caption_id` | `sds/<segment_id>/captions/<caption_id>` (e.g. `v1.txt`) |
 
 On-disk sample stem is `control_bundle_id`. Invalid samples (missing files or empty caption)
 are skipped with a warning; the job fails only if zero valid samples remain.
@@ -64,7 +87,10 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 | Key | Description |
 |-----|-------------|
 | `training_run_id` | Run id; used as `job.name` and W&B run name |
-| `manifest_bucket` / `manifest_key` | OCI location of JSONL manifest |
+| `manifest_bucket` | OCI bucket for training inputs |
+| `flyte_job_id` | Finetuning run id; reads `finetuning_jobs/<id>/segment_annotation_control_bundle.txt` |
+| `caption_id` | Caption version filename (required with `flyte_job_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
+| `manifest_key` | Legacy JSONL manifest key (use when `flyte_job_id` is unset) |
 | `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` |
 | `checkpoint_bucket` / `checkpoint_key` | Base model `.pt` cached locally (default: base) |
 | `hf_cache_bucket` / `hf_cache_prefix` | Pre-staged HuggingFace cache |
