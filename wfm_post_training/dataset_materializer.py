@@ -11,7 +11,9 @@ from typing import TYPE_CHECKING
 
 from wfm_post_training.camera_names import (
     CAPTION_FOLDER,
+    CAPTION_SOURCE_FOLDERS,
     SDS_CAMERA_SHORT_NAMES,
+    oci_stem_aliases,
     short_camera_name,
 )
 from wfm_post_training.oci_helpers import download_file, object_exists
@@ -22,7 +24,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CONTROL_BUNDLE_PREFIX = "control_bundles"
-RGB_PREFIX = "rgb"
+RGB_PREFIX = "rgb/sds"
 CAPTIONS_PREFIX = "captions"
 FINETUNING_JOBS_PREFIX = "finetuning_jobs"
 # Legacy layout prefix; used only when use_legacy_sds_paths is True.
@@ -217,10 +219,40 @@ def _resolve_control_paths(
     return _control_paths_from_listing(client, bucket, bundle_id)
 
 
-def _rgb_key(segment_id: str, short_name: str, *, use_legacy_sds_paths: bool) -> str:
+def _rgb_key_candidates(
+    segment_id: str,
+    short_name: str,
+    *,
+    use_legacy_sds_paths: bool,
+) -> list[str]:
     if use_legacy_sds_paths:
-        return f"{SDS_PREFIX}/{segment_id}/rgb/{short_name}.mp4"
-    return f"{RGB_PREFIX}/{segment_id}/{short_name}.mp4"
+        return [f"{SDS_PREFIX}/{segment_id}/rgb/{short_name}.mp4"]
+    return [
+        f"{RGB_PREFIX}/{segment_id}/{stem}.mp4"
+        for stem in oci_stem_aliases(short_name)
+    ]
+
+
+def _rgb_key(segment_id: str, short_name: str, *, use_legacy_sds_paths: bool) -> str:
+    return _rgb_key_candidates(
+        segment_id,
+        short_name,
+        use_legacy_sds_paths=use_legacy_sds_paths,
+    )[0]
+
+
+def _caption_key_candidates(
+    segment_id: str,
+    caption_version: str,
+    *,
+    use_legacy_sds_paths: bool,
+) -> list[str]:
+    if use_legacy_sds_paths:
+        return [f"{SDS_PREFIX}/{segment_id}/captions/{caption_version}"]
+    return [
+        f"{CAPTIONS_PREFIX}/{segment_id}/{folder}/{caption_version}.json"
+        for folder in CAPTION_SOURCE_FOLDERS
+    ]
 
 
 def _caption_key(
@@ -229,9 +261,22 @@ def _caption_key(
     *,
     use_legacy_sds_paths: bool,
 ) -> str:
-    if use_legacy_sds_paths:
-        return f"{SDS_PREFIX}/{segment_id}/captions/{caption_version}"
-    return f"{CAPTIONS_PREFIX}/{segment_id}/{CAPTION_FOLDER}/{caption_version}.json"
+    return _caption_key_candidates(
+        segment_id,
+        caption_version,
+        use_legacy_sds_paths=use_legacy_sds_paths,
+    )[0]
+
+
+def _first_existing_key(
+    client: "boto3.client",
+    bucket: str,
+    keys: list[str],
+) -> str | None:
+    for key in keys:
+        if object_exists(client, bucket, key):
+            return key
+    return None
 
 
 def _read_caption_text(caption_path: Path, *, use_legacy_sds_paths: bool) -> str:
@@ -240,9 +285,16 @@ def _read_caption_text(caption_path: Path, *, use_legacy_sds_paths: bool) -> str
         return ""
     if use_legacy_sds_paths:
         return raw
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Invalid caption JSON at %s", caption_path)
+        return ""
     if isinstance(data, dict):
-        return str(data.get("caption", "")).strip()
+        caption = data.get("caption")
+        if caption is None:
+            return ""
+        return str(caption).strip()
     return raw
 
 
@@ -259,20 +311,35 @@ def _materialize_sample(
     control_paths = _resolve_control_paths(client, bucket, entry.control_bundle_id)
 
     missing: list[str] = []
+    rgb_keys: dict[str, str] = {}
     for short_name in SDS_CAMERA_SHORT_NAMES:
         control_key = control_paths.get(short_name)
-        rgb_key = _rgb_key(entry.segment_id, short_name, use_legacy_sds_paths=use_legacy_sds_paths)
+        resolved_rgb_key = _first_existing_key(
+            client,
+            bucket,
+            _rgb_key_candidates(
+                entry.segment_id,
+                short_name,
+                use_legacy_sds_paths=use_legacy_sds_paths,
+            ),
+        )
         if control_key is None or not object_exists(client, bucket, control_key):
             missing.append(f"control/{short_name}")
-        elif not object_exists(client, bucket, rgb_key):
+        elif resolved_rgb_key is None:
             missing.append(f"rgb/{short_name}")
+        else:
+            rgb_keys[short_name] = resolved_rgb_key
 
-    caption_key = _caption_key(
-        entry.segment_id,
-        entry.caption_version,
-        use_legacy_sds_paths=use_legacy_sds_paths,
+    caption_key = _first_existing_key(
+        client,
+        bucket,
+        _caption_key_candidates(
+            entry.segment_id,
+            entry.caption_version,
+            use_legacy_sds_paths=use_legacy_sds_paths,
+        ),
     )
-    if not object_exists(client, bucket, caption_key):
+    if caption_key is None:
         missing.append("caption")
 
     if missing:
@@ -303,12 +370,7 @@ def _materialize_sample(
         control_dest = dataset_dir / "control_input_hdmap_bbox" / short_name / f"{sample_id}.mp4"
         rgb_dest = dataset_dir / "videos" / short_name / f"{sample_id}.mp4"
         download_file(client, bucket, control_paths[short_name], control_dest)
-        download_file(
-            client,
-            bucket,
-            _rgb_key(entry.segment_id, short_name, use_legacy_sds_paths=use_legacy_sds_paths),
-            rgb_dest,
-        )
+        download_file(client, bucket, rgb_keys[short_name], rgb_dest)
 
     caption_dest = dataset_dir / "captions" / CAPTION_FOLDER / f"{sample_id}.json"
     caption_dest.parent.mkdir(parents=True, exist_ok=True)

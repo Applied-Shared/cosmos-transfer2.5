@@ -7,10 +7,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from wfm_post_training.camera_names import CAPTION_SOURCE_FOLDERS, oci_stem_aliases
 from wfm_post_training.dataset_materializer import (
     _caption_key,
+    _caption_key_candidates,
     _read_caption_text,
     _rgb_key,
+    _rgb_key_candidates,
     finetuning_mapping_key,
     finetuning_mapping_to_manifest_entries,
     load_finetuning_mapping,
@@ -66,7 +69,7 @@ class FinetuningMappingHelpersTest(unittest.TestCase):
 class OciPathHelpersTest(unittest.TestCase):
     def test_rgb_key_canonical_layout(self) -> None:
         self.assertEqual(
-            "rgb/seg-1/front_wide.mp4",
+            "rgb/sds/seg-1/front_wide.mp4",
             _rgb_key("seg-1", "front_wide", use_legacy_sds_paths=False),
         )
 
@@ -85,6 +88,41 @@ class OciPathHelpersTest(unittest.TestCase):
                 use_legacy_sds_paths=False,
             ),
         )
+
+    def test_rgb_key_candidates_include_rog_aliases(self) -> None:
+        keys = _rgb_key_candidates("seg-1", "front_wide", use_legacy_sds_paths=False)
+        self.assertEqual("rgb/sds/seg-1/front_wide.mp4", keys[0])
+        self.assertIn("rgb/sds/seg-1/FRONT_CENTER.mp4", keys)
+        self.assertIn("rgb/sds/seg-1/camera_front_wide_120fov.mp4", keys)
+
+    def test_caption_key_candidates_include_front_center(self) -> None:
+        keys = _caption_key_candidates(
+            "seg-1",
+            "cosmos-reason2-2b_prompts-v1",
+            use_legacy_sds_paths=False,
+        )
+        self.assertEqual(
+            "captions/seg-1/front_wide/cosmos-reason2-2b_prompts-v1.json",
+            keys[0],
+        )
+        self.assertIn(
+            "captions/seg-1/FRONT_CENTER/cosmos-reason2-2b_prompts-v1.json",
+            keys,
+        )
+
+    def test_oci_stem_aliases_cover_short_and_rog_names(self) -> None:
+        self.assertEqual(
+            ("front_wide", "FRONT_CENTER", "camera_front_wide_120fov"),
+            oci_stem_aliases("front_wide"),
+        )
+        self.assertEqual(
+            ("rear", "REAR_CENTER", "camera_rear_tele_30fov"),
+            oci_stem_aliases("rear"),
+        )
+
+    def test_caption_source_folders_match_wfm_layout(self) -> None:
+        self.assertIn("FRONT_CENTER", CAPTION_SOURCE_FOLDERS)
+        self.assertIn("front_wide", CAPTION_SOURCE_FOLDERS)
 
     def test_caption_key_legacy_layout(self) -> None:
         self.assertEqual(
@@ -107,6 +145,17 @@ class ReadCaptionTextTest(unittest.TestCase):
                 "scene text",
                 _read_caption_text(path, use_legacy_sds_paths=False),
             )
+
+    def test_should_treat_null_caption_as_empty(self) -> None:
+        path = Path("/tmp/caption.json")
+        payload = json.dumps({"caption": None})
+        with mock.patch.object(Path, "read_text", return_value=payload):
+            self.assertEqual("", _read_caption_text(path, use_legacy_sds_paths=False))
+
+    def test_should_treat_invalid_json_as_empty(self) -> None:
+        path = Path("/tmp/caption.json")
+        with mock.patch.object(Path, "read_text", return_value="not-json"):
+            self.assertEqual("", _read_caption_text(path, use_legacy_sds_paths=False))
 
 
 if __name__ == "__main__":
