@@ -3,7 +3,7 @@
 from typing import Final
 
 # Stable short names used as folder names in the materialized training dataset
-# and as SDS rgb object keys (sds/<segment_id>/rgb/<short_name>.mp4).
+# and as SDS rgb object keys (rgb/sds/<segment_id>/<short_name>.mp4).
 SDS_CAMERA_SHORT_NAMES: Final[tuple[str, ...]] = (
     "cross_left",
     "cross_right",
@@ -14,8 +14,14 @@ SDS_CAMERA_SHORT_NAMES: Final[tuple[str, ...]] = (
     "rear",
 )
 
-# Caption JSON lives under captions/front_wide/ (front-only captions).
+# Local training layout always uses short-name caption folders.
 CAPTION_FOLDER: Final[str] = "front_wide"
+
+# OCI caption folders to try (WFM captioning writes FRONT_CENTER today).
+CAPTION_SOURCE_FOLDERS: Final[tuple[str, ...]] = (
+    "front_wide",
+    "FRONT_CENTER",
+)
 
 # Mirror of adp/services/wfm/async_job_runners/conditioning/core/bundle/camera_short_names.go.
 RAW_NAME_TO_SHORT: Final[dict[str, str]] = {
@@ -49,3 +55,12 @@ RAW_NAME_TO_SHORT: Final[dict[str, str]] = {
 def short_camera_name(raw_name: str) -> str:
     """Return the canonical short name for a raw sensor or spec.json camera key."""
     return RAW_NAME_TO_SHORT.get(raw_name, raw_name)
+
+
+def oci_stem_aliases(short_name: str) -> tuple[str, ...]:
+    """Return object-key filename stems to try for a canonical short camera name."""
+    stems: list[str] = [short_name]
+    for raw_name, mapped_short in RAW_NAME_TO_SHORT.items():
+        if mapped_short == short_name and raw_name not in stems:
+            stems.append(raw_name)
+    return tuple(stems)

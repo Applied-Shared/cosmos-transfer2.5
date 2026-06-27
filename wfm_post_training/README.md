@@ -24,23 +24,46 @@ lilypad workload launch adp/services/wfm/lilypad_workload_configs/cosmos_transfe
 
 Get a W&B API key from https://appliedintuition.wandb.io/settings.
 
-## Manifest format (JSONL)
+## Manifest format
+
+### Finetuning mapping (recommended)
+
+When `flyte_job_id` and `caption_version` are set in the workload config, the entrypoint
+reads:
+
+```
+finetuning_jobs/<flyte_job_id>/segment_annotation_control_bundle.txt
+```
+
+Each non-empty line: `<segment_id> <annotation_hash> <control_bundle_id>`
+
+OCI sources resolved per sample (WFM canonical layout):
+
+| Field | OCI path |
+|-------|----------|
+| `control_bundle_id` | `control_bundles/<id>/` via `spec.json` or `cameras/*/bbox.mp4` |
+| `segment_id` | `rgb/sds/<segment_id>/{short_name\|ROG\|rig}.mp4` — tries lowercase short name first, then ROG names like `FRONT_CENTER`, then Cosmos rig names |
+| `caption_version` | `captions/<segment_id>/{front_wide\|FRONT_CENTER}/<caption_version>.json` |
+
+Example `caption_version`: `cosmos-reason2-2b_prompts-v1`
+
+### Legacy JSONL manifest
 
 Upload to OCI before launch (one sample per line):
 
 ```json
-{"control_bundle_id":"<uuid>","segment_id":"<segment>","caption_id":"<caption>"}
+{"control_bundle_id":"<uuid>","segment_id":"<segment>","caption_version":"<caption>"}
 ```
 
 Example key: `post_training/example-run-001/manifest.jsonl`
 
-Each line references three OCI sources:
+Each line references three OCI sources (legacy `sds/` layout):
 
 | Field | OCI path |
 |-------|----------|
 | `control_bundle_id` | `control_bundles/<id>/cameras/*/bbox.mp4` |
 | `segment_id` | `sds/<segment_id>/rgb/<short_name>.mp4` (7 cameras) |
-| `caption_id` | `sds/<segment_id>/captions/<caption_id>` (e.g. `v1.txt` for a caption version) |
+| `caption_version` | `sds/<segment_id>/captions/<caption_version>` (e.g. `v1.txt`) |
 
 On-disk sample stem is `control_bundle_id`. Invalid samples (missing files or empty caption)
 are skipped with a warning; the job fails only if zero valid samples remain.
@@ -63,9 +86,12 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 
 | Key | Description |
 |-----|-------------|
-| `training_run_id` | Run id; used as `job.name` and W&B run name |
-| `manifest_bucket` / `manifest_key` | OCI location of JSONL manifest |
-| `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` |
+| `training_run_id` | `finetuning_runs.uuid` for this Lilypad submission; used as `job.name`, W&B run name, and local cache dir |
+| `manifest_bucket` | OCI bucket for training inputs |
+| `flyte_job_id` | Flyte campaign id; reads `finetuning_jobs/<flyte_job_id>/segment_annotation_control_bundle.txt` |
+| `caption_version` | Caption version filename (required with `flyte_job_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
+| `manifest_key` | Legacy JSONL manifest key (use when `flyte_job_id` is unset) |
+| `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` (`finetuning_jobs/<finetuning_run_id>/` when submitted via WFM) |
 | `checkpoint_bucket` / `checkpoint_key` | Base model `.pt` cached locally (default: base) |
 | `hf_cache_bucket` / `hf_cache_prefix` | Pre-staged HuggingFace cache |
 | `experiment` | Hydra experiment (default: `transfer2_auto_multiview_post_train_example`) |
@@ -108,12 +134,12 @@ python3 wfm_post_training/upload_local_dataset_to_oci.py \
   --dataset-dir /path/to/rog102_v2 \
   --run-id rog102-v2-test \
   --max-samples 5 \
-  --caption-id v1.txt
+  --caption-version v1.txt
 ```
 
-`--caption-id` is the object name under `sds/<segment_id>/captions/` (default `v1.txt`).
-Use a new id (e.g. `v2.txt`) when uploading a revised caption for the same segment; point
-the manifest at the desired `caption_id` per sample.
+`--caption-version` is the object name under `sds/<segment_id>/captions/` (default `v1.txt`).
+Use a new version (e.g. `v2.txt`) when uploading a revised caption for the same segment; point
+the manifest at the desired `caption_version` per sample.
 
 ## Fake data for testing
 
@@ -129,7 +155,7 @@ post_training/test-run/manifest.jsonl
 Manifest line:
 
 ```json
-{"control_bundle_id":"<uuid>","segment_id":"test-segment-001","caption_id":"cap-v1.txt"}
+{"control_bundle_id":"<uuid>","segment_id":"test-segment-001","caption_version":"cap-v1.txt"}
 ```
 
 Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to match.
