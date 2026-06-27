@@ -17,6 +17,7 @@ from wfm_post_training.camera_names import (
     short_camera_name,
 )
 from wfm_post_training.oci_helpers import download_file, object_exists
+from wfm_post_training.video_utils import normalize_training_video_pair
 
 if TYPE_CHECKING:
     import boto3
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 CONTROL_BUNDLE_PREFIX = "control_bundles"
 RGB_PREFIX = "rgb/sds"
 CAPTIONS_PREFIX = "captions"
-FINETUNING_JOBS_PREFIX = "finetuning_jobs"
+FINETUNING_DATASETS_PREFIX = "finetuning_datasets"
 # Legacy layout prefix; used only when use_legacy_sds_paths is True.
 SDS_PREFIX = "sds"
 
@@ -81,9 +82,9 @@ def load_finetuning_mapping(mapping_text: str) -> list[FinetuningMappingEntry]:
 
 
 def finetuning_mapping_key(flyte_job_id: str) -> str:
-    """Return the OCI key for a finetuning run's segment-to-bundle mapping file."""
+    """Return the OCI key for a finetuning campaign's segment-to-bundle mapping file."""
     return (
-        f"{FINETUNING_JOBS_PREFIX}/{flyte_job_id}/segment_annotation_control_bundle.txt"
+        f"{FINETUNING_DATASETS_PREFIX}/{flyte_job_id}/segment_annotation_control_bundle.txt"
     )
 
 
@@ -371,6 +372,9 @@ def _materialize_sample(
         rgb_dest = dataset_dir / "videos" / short_name / f"{sample_id}.mp4"
         download_file(client, bucket, control_paths[short_name], control_dest)
         download_file(client, bucket, rgb_keys[short_name], rgb_dest)
+        if not use_legacy_sds_paths:
+            # Cosmos requires RGB and control decord FPS to match exactly.
+            normalize_training_video_pair(rgb_dest, control_dest, logger)
 
     caption_dest = dataset_dir / "captions" / CAPTION_FOLDER / f"{sample_id}.json"
     caption_dest.parent.mkdir(parents=True, exist_ok=True)
