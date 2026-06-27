@@ -48,21 +48,24 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash 
 
 WORKDIR /workspace
 
-# Install the project's dependencies using the lockfile and settings
+# Install the project's dependencies using the lockfile and settings.
+# Host .python-version may be 3.13 (cu130 local dev), but Lilypad needs 3.10 for
+# cu128 flash-attn wheels and ray[default]==2.50.1.7.
+ARG PYTHON_VERSION=3.10
 ARG CUDA_NAME=cu128
 ENV CUDA_NAME=${CUDA_NAME}
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    --mount=type=bind,source=.python-version,target=.python-version \
     --mount=type=bind,source=packages,target=packages \
+    echo "${PYTHON_VERSION}" > .python-version && \
     uv sync --locked --no-install-project --extra=${CUDA_NAME}
 
 # Copy the code into the container if in standalone mode. Otherwise, just install the dependencies at runtime.
 # We mount the source code to /tmp and copy it to /workspace if in standalone mode.
 ARG STANDALONE
 RUN --mount=type=bind,source=.,target=/tmp/workspace \
-   if [ "$STANDALONE" = "true" ] ; then cp -r /tmp/workspace/* /workspace && just install ${CUDA_NAME} && rm -rf /workspace/.git ; else echo "Run just install to install all the dependencies at runtime" ; fi
+   if [ "$STANDALONE" = "true" ] ; then cp -r /tmp/workspace/* /workspace && echo "${PYTHON_VERSION}" > /workspace/.python-version && just install ${CUDA_NAME} && rm -rf /workspace/.git ; else echo "Run just install to install all the dependencies at runtime" ; fi
 
 # Place executables in the environment at the front of the path
 ENV PATH="/workspace/.venv/bin:$PATH"
