@@ -14,6 +14,7 @@ from lilypad.public.sdk_py.cached_file_access.boto import get_readonly_boto_clie
 from wfm_post_training.dataset_materializer import (
     download_finetuning_mapping,
     download_manifest,
+    finetuning_mapping_key,
     finetuning_mapping_to_manifest_entries,
     materialize_dataset,
 )
@@ -119,6 +120,8 @@ def _wandb_login(worker_logger: logging.Logger, wandb_dir: Path) -> None:
     if not api_key:
         raise RuntimeError("WANDB_API_KEY is required for post-training")
     host = os.environ.get("WANDB_BASE_URL", "https://appliedintuition.wandb.io")
+    entity = os.environ.get("WANDB_ENTITY", "sensor-platform")
+    os.environ["WANDB_ENTITY"] = entity
 
     # Ray may set WANDB_DIR under /tmp/ray/wandb, which is not writable on GPU workers.
     wandb_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +131,7 @@ def _wandb_login(worker_logger: logging.Logger, wandb_dir: Path) -> None:
     netrc_path = wandb_dir / ".netrc"
     os.environ["NETRC"] = str(netrc_path)
 
-    worker_logger.info("Logging in to W&B at %s (dir=%s)", host, wandb_dir)
+    worker_logger.info("Logging in to W&B at %s entity=%s (dir=%s)", host, entity, wandb_dir)
     import wandb
 
     wandb.login(key=api_key, host=host, relogin=True)
@@ -281,14 +284,17 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
     manifest_key = (config.get("manifest_key") or "").strip()
 
     if flyte_job_id:
-        caption_version = (config.get("caption_version") or "").strip()
+        caption_version = (config.get("caption_version") or config.get("caption_id") or "").strip()
         if not caption_version:
-            raise ValueError("caption_version is required when flyte_job_id is set")
+            raise ValueError(
+                "caption_version is required when flyte_job_id is set "
+                "(caption_id is deprecated)"
+            )
+        mapping_key = finetuning_mapping_key(flyte_job_id)
         worker_logger.info(
-            "Downloading finetuning mapping s3://%s/finetuning_jobs/%s/"
-            "segment_annotation_control_bundle.txt",
+            "Downloading finetuning mapping s3://%s/%s",
             manifest_bucket,
-            flyte_job_id,
+            mapping_key,
         )
         mapping_entries = download_finetuning_mapping(
             plain_client,
@@ -316,9 +322,63 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
     return entries, True
 
 
+def _debug_upload_materialized_dataset(
+    plain_client,
+    config: dict,
+    dataset_dir: Path,
+    worker_logger: logging.Logger,
+) -> None:
+    """TEMP: upload the materialized dataset tree to OCI for offline inspection."""
+    enabled = config.get("debug_upload_materialized_dataset", False)
+    if not enabled:
+        env_flag = os.environ.get("DEBUG_UPLOAD_MATERIALIZED_DATASET", "").lower()
+        enabled = env_flag in ("1", "true", "yes")
+    if not enabled:
+        return
+
+    output_bucket = config["output_bucket"]
+    output_prefix = config["output_prefix"].rstrip("/")
+    debug_prefix = f"{output_prefix}/_debug/materialized_dataset"
+    worker_logger.info(
+        "TEMP debug upload: materialized dataset %s -> s3://%s/%s/",
+        dataset_dir,
+        output_bucket,
+        debug_prefix,
+    )
+    upload_directory(plain_client, dataset_dir, output_bucket, debug_prefix, worker_logger)
+    plain_client.put_object(
+        Body=b"",
+        Bucket=output_bucket,
+        Key=f"{debug_prefix}/materialized_dataset_uploaded.txt",
+    )
+    worker_logger.info(
+        "TEMP debug upload complete: s3://%s/%s/",
+        output_bucket,
+        debug_prefix,
+    )
+
+
 @ray.remote
 def _run_post_training_on_gpu(config: dict) -> None:
     """Runs on the GPU worker: materialize dataset, train, upload checkpoints."""
+    # Import inside the remote function so Ray workers resolve deps from the same
+    # baked /workspace tree as the driver (matches wfm_inference/lilypad_entrypoint.py).
+    import logging
+    import os
+    import subprocess
+    from pathlib import Path
+
+    from lilypad.public.sdk_py.cached_file_access.boto import get_readonly_boto_client
+
+    from wfm_post_training.dataset_materializer import materialize_dataset
+    from wfm_post_training.oci_helpers import (
+        download_checkpoint,
+        make_plain_client,
+        setup_hf_cache,
+        upload_directory,
+        upload_file,
+    )
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     worker_logger = logging.getLogger(__name__)
 
@@ -357,13 +417,23 @@ def _run_post_training_on_gpu(config: dict) -> None:
             worker_logger,
         )
 
-    entries, use_legacy_sds_paths = _load_training_entries(config, plain_client, worker_logger)
+    entries, use_legacy_sds_paths = _load_training_entries(
+        config,
+        plain_client,
+        worker_logger,
+    )
     materialize_dataset(
         plain_client,
         config["manifest_bucket"],
         entries,
         dataset_dir,
         use_legacy_sds_paths=use_legacy_sds_paths,
+    )
+    _debug_upload_materialized_dataset(
+        plain_client,
+        config,
+        dataset_dir,
+        worker_logger,
     )
 
     resume_path: Path | None = None
@@ -449,7 +519,7 @@ def run(config: dict) -> None:
         hf_cache_prefix:      prefix under hf_cache_bucket
 
     Input manifest — provide either:
-        flyte_job_id + caption_version: reads finetuning_jobs/<flyte_job_id>/
+        flyte_job_id + caption_version: reads finetuning_datasets/<flyte_job_id>/
             segment_annotation_control_bundle.txt and WFM canonical OCI paths
         manifest_key: legacy JSONL manifest at manifest_bucket/manifest_key
 
@@ -462,6 +532,8 @@ def run(config: dict) -> None:
         save_iter:            checkpoint save frequency (default 200)
         resume_from_oci:      download latest OCI checkpoint before training (default false)
         checkpoint_load_path: override initial checkpoint.load_path (local path or URI)
+        debug_upload_materialized_dataset: TEMP — upload dataset_dir to
+            output_prefix/_debug/materialized_dataset/ after materialize (default false)
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 

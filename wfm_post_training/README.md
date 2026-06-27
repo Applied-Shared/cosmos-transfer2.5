@@ -15,14 +15,16 @@ Same Ray head/GPU-worker split as inference (`wfm_inference/lilypad_entrypoint.p
 ## Manual launch
 
 ```bash
-export WANDB_API_KEY=<your api key>
+export WANDB_API_KEY=<from 1Password item "WFM W&B API Key (sensor-platform)">
+export WANDB_ENTITY=sensor-platform
 export AWS_ACCESS_KEY_ID=<oci-access-key>
 export AWS_SECRET_ACCESS_KEY=<oci-secret-key>
 
 lilypad workload launch adp/services/wfm/lilypad_workload_configs/cosmos_transfer_post_training.yaml
 ```
 
-Get a W&B API key from https://appliedintuition.wandb.io/settings.
+Create a personal W&B API key at https://appliedintuition.wandb.io/settings if needed.
+For team runs, use the shared key from 1Password item **WFM W&B API Key (sensor-platform)**.
 
 ## Manifest format
 
@@ -32,7 +34,7 @@ When `flyte_job_id` and `caption_version` are set in the workload config, the en
 reads:
 
 ```
-finetuning_jobs/<flyte_job_id>/segment_annotation_control_bundle.txt
+finetuning_datasets/<flyte_job_id>/segment_annotation_control_bundle.txt
 ```
 
 Each non-empty line: `<segment_id> <annotation_hash> <control_bundle_id>`
@@ -88,7 +90,7 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 |-----|-------------|
 | `training_run_id` | `finetuning_runs.uuid` for this Lilypad submission; used as `job.name`, W&B run name, and local cache dir |
 | `manifest_bucket` | OCI bucket for training inputs |
-| `flyte_job_id` | Flyte campaign id; reads `finetuning_jobs/<flyte_job_id>/segment_annotation_control_bundle.txt` |
+| `flyte_job_id` | Flyte campaign id; reads `finetuning_datasets/<flyte_job_id>/segment_annotation_control_bundle.txt` |
 | `caption_version` | Caption version filename (required with `flyte_job_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
 | `manifest_key` | Legacy JSONL manifest key (use when `flyte_job_id` is unset) |
 | `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` (`finetuning_jobs/<finetuning_run_id>/` when submitted via WFM) |
@@ -118,11 +120,13 @@ Training writes DCP checkpoints under:
 | During training | Background watcher uploads each new iter to OCI |
 | On success | Converts latest DCP to `model_ema_bf16.pt` and uploads to `output_prefix/` |
 
-## W&B from a service (future)
+## W&B from WFM service submit
 
 The workload YAML lists `WANDB_API_KEY` under `required_environment_variables`. When WFM
 submits this workload, `buildEnvVars` forwards keys from the WFM pod environment. Mount
-`WANDB_API_KEY` as a K8s secret on the WFM deployment (same pattern as OCI creds).
+`WANDB_API_KEY` as a K8s secret on the WFM deployment (same pattern as OCI creds). Source
+the value from 1Password item **WFM W&B API Key (sensor-platform)**. Set `WANDB_ENTITY`
+to `sensor-platform` in the workload YAML (or rely on the entrypoint default).
 
 ## Upload local dataset to OCI
 
@@ -165,14 +169,19 @@ Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to mat
 ```bash
 cd /home/yun/cosmos-transfer2.5
 docker build -f Dockerfile \
+  --no-cache \
   --build-arg CUDA_NAME=cu128 \
   --build-arg STANDALONE=true \
-  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.23 .
+  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.27 .
 
-docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.23
+docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.27
 ```
 
-Then update `docker_image` in `cosmos_transfer_post_training.yaml`.
+Then update `docker_image` in `cosmos_transfer_post_training.yaml` (applied3) to
+`cosmos_transfer2.5_v0.0.27` or newer.
+
+Use `--no-cache` when rebuilding after changing files under `wfm_post_training/`
+so Ray head and GPU workers get the same code:
 
 ## OCI S3-compat gotcha
 
