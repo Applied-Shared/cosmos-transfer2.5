@@ -113,3 +113,109 @@ def test_should_default_dimensions_when_dimensions_null(monkeypatch):
     assert len(scene.traffic_lights) == 1
     np.testing.assert_array_equal(scene.traffic_lights[0].dimensions, [0.6, 0.6, 1.0])
     assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 2
+
+
+def _scene_with_frame_timestamps(frame_timestamps) -> "data_types.SceneData":
+    """A SceneData whose ego-pose timestamps define the render frame grid."""
+    scene = data_types.SceneData(scene_id="test_clip", duration_seconds=0.0)
+    scene.ego_poses = [
+        data_types.EgoPose(
+            timestamp=int(ts),
+            position=np.zeros(3, dtype=np.float32),
+            orientation=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        for ts in frame_timestamps
+    ]
+    return scene
+
+
+def _load_keyed(monkeypatch, scene, rows) -> None:
+    """Run _load_traffic_lights against a parquet of ``rows`` (traffic_light + key)."""
+    df = pd.DataFrame(
+        {
+            "traffic_light": [r["traffic_light"] for r in rows],
+            "key": [r["key"] for r in rows],
+        }
+    )
+    monkeypatch.setattr(clipgt_loader.pd, "read_parquet", lambda _path: df)
+    clipgt_loader.ClipGTLoader()._load_traffic_lights(scene, Path("unused.traffic_light.parquet"))
+
+
+def _key(label_id, timestamp):
+    return {"label_class_id": label_id, "timestamp_micros": timestamp}
+
+
+def test_should_step_state_per_frame_when_observations_timestamped(monkeypatch):
+    # Precondition. One signal, RED at t=0 then GREEN at t=20; frames at 0,10,20,30.
+    scene = _scene_with_frame_timestamps([0, 10, 20, 30])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("7", 0)},
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "GREEN"}, "key": _key("7", 20)},
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Hold-last: RED until the GREEN observation at t=20.
+    assert len(scene.traffic_lights) == 1
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED", "RED", "GREEN", "GREEN"]
+
+
+def test_should_collapse_rows_with_same_label_class_id_into_one_light(monkeypatch):
+    # Precondition. Two timestamped rows for the same signal.
+    scene = _scene_with_frame_timestamps([0, 10])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("7", 0)},
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "GREEN"}, "key": _key("7", 10)},
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. One physical light, not two.
+    assert len(scene.traffic_lights) == 1
+
+
+def test_should_emit_separate_lights_per_label_class_id(monkeypatch):
+    # Precondition. Two distinct signals.
+    scene = _scene_with_frame_timestamps([0, 10])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("7", 0)},
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "GREEN"}, "key": _key("8", 0)},
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition.
+    assert len(scene.traffic_lights) == 2
+
+
+def test_should_hold_first_state_for_frames_before_first_observation(monkeypatch):
+    # Precondition. First observation is at t=15, after frames at 0 and 10.
+    scene = _scene_with_frame_timestamps([0, 10, 20])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "GREEN"}, "key": _key("7", 15)},
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("7", 18)},
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Leading frames clamp to the earliest observation.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["GREEN", "GREEN", "RED"]
+
+
+def test_should_broadcast_when_label_present_but_timestamp_null(monkeypatch):
+    # Precondition. Legacy/static shape: one row per signal, null timestamp.
+    scene = _scene_with_frame_timestamps([0, 10, 20])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("7", None)},
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Single representative state broadcast across all frames.
+    assert len(scene.traffic_lights) == 1
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 3

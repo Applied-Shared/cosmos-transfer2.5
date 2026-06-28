@@ -931,21 +931,39 @@ class ClipGTLoader(SceneDataLoader):
                     )
 
     def _load_traffic_lights(self, scene_data: SceneData, traffic_light_file: Path) -> None:
-        """Load traffic lights, carrying each signal's color onto the light.
+        """Load traffic lights, carrying each signal's per-frame color onto the light.
 
-        The parquet ``state`` column holds one representative color per signal
-        (e.g. "RED"/"YELLOW"/"GREEN"). It is broadcast across all frames via
-        ``metadata["state_sequence"]`` so the renderer colors the light; an
-        absent/empty state leaves the light UNKNOWN (gray). Orientation is
-        optional: a missing or null quaternion falls back to identity instead
-        of raising.
+        The parquet may store either a single representative ``state`` per signal
+        (one row, ``timestamp_micros`` null) or a per-frame series (one row per
+        ``(label_class_id, timestamp_micros)``, mirroring the obstacle parquet).
+        Rows are grouped by ``label_class_id`` -- the stable per-signal id -- so a
+        signal that changes color mid-clip becomes a single light whose
+        ``metadata["state_sequence"]`` steps through its colors, aligned onto the
+        ego/render frame grid by holding the last observed state between updates.
+        A signal with no usable state stays UNKNOWN (gray). Orientation is
+        optional: a missing or null quaternion falls back to identity instead of
+        raising.
         """
         df = pd.read_parquet(traffic_light_file)
 
         num_frames = max(1, scene_data.num_frames)
+        frame_timestamps = scene_data.timestamps  # microseconds, one per frame
 
+        # Group rows by the stable per-signal id so multiple per-timestamp rows
+        # collapse into one light. Fall back to the row index when the key is
+        # absent (legacy single-row-per-signal parquets).
+        grouped: Dict[str, List[Tuple[Optional[int], Dict[str, Any]]]] = defaultdict(list)
         for idx, row in df.iterrows():
             light = cast(Dict[str, Any], row["traffic_light"])
+            key = row["key"] if "key" in row else None
+            label_id = key.get("label_class_id") if isinstance(key, dict) else None
+            timestamp = key.get("timestamp_micros") if isinstance(key, dict) else None
+            group_id = str(label_id) if label_id is not None else f"row_{idx}"
+            grouped[group_id].append((timestamp, light))
+
+        for group_id, observations in grouped.items():
+            # Geometry is static per signal: parse it from the first observation.
+            light = observations[0][1]
 
             center = np.array(
                 [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
@@ -976,20 +994,67 @@ class ClipGTLoader(SceneDataLoader):
             orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
 
             traffic_light = TrafficLight(
-                element_id=f"traffic_light_{idx}",
+                element_id=f"traffic_light_{group_id}",
                 center=center,
                 dimensions=dimensions,
                 orientation=orientation,
             )
 
-            # Carry the representative color onto the light. The renderer reads a
-            # per-frame sequence and pads (does not broadcast) a short one, so emit
-            # one entry per frame. An absent/empty state stays UNKNOWN (gray).
-            state = light["state"] if "state" in light else None
-            if isinstance(state, str) and state.strip():
-                traffic_light.metadata["state_sequence"] = [state] * num_frames
+            # Build the per-frame color sequence. Timestamped observations step
+            # through colors aligned to the frame grid (hold-last); a single
+            # untimed row broadcasts its state. An absent state stays gray.
+            state_sequence = self._build_traffic_light_state_sequence(
+                observations, frame_timestamps, num_frames
+            )
+            if state_sequence is not None:
+                traffic_light.metadata["state_sequence"] = state_sequence
 
             scene_data.traffic_lights.append(traffic_light)
+
+    @staticmethod
+    def _build_traffic_light_state_sequence(
+        observations: List[Tuple[Optional[int], Dict[str, Any]]],
+        frame_timestamps: np.ndarray,
+        num_frames: int,
+    ) -> Optional[List[str]]:
+        """Build a length-``num_frames`` list of traffic-light state strings.
+
+        ``observations`` are ``(timestamp_micros, light)`` tuples for one signal.
+        Observations carrying a usable state and a timestamp are sorted and mapped
+        onto ``frame_timestamps`` by holding the most recent state at or before
+        each frame (leading frames clamp to the first observation). When no
+        observation carries a timestamp, the single representative state is
+        broadcast across all frames. Returns ``None`` when the signal has no
+        usable (non-empty string) state, leaving the light UNKNOWN (gray).
+        """
+        timed: List[Tuple[int, str]] = []
+        untimed_state: Optional[str] = None
+        for timestamp, light in observations:
+            state = light.get("state") if isinstance(light, dict) else None
+            if not (isinstance(state, str) and state.strip()):
+                continue
+            if timestamp is None:
+                untimed_state = state
+            else:
+                timed.append((int(timestamp), state))
+
+        if timed:
+            timed.sort(key=lambda ts_state: ts_state[0])
+            observed_ts = np.array([ts for ts, _ in timed], dtype=np.int64)
+            observed_states = [state for _, state in timed]
+            if frame_timestamps is None or len(frame_timestamps) == 0:
+                # No frame grid to align to: hold the earliest observed state.
+                return [observed_states[0]] * num_frames
+            # Most recent observation at or before each frame; clamp leading
+            # frames (before the first observation) to the first state.
+            indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
+            indices = np.clip(indices, 0, len(observed_states) - 1)
+            return [observed_states[int(i)] for i in indices]
+
+        if untimed_state is not None:
+            return [untimed_state] * num_frames
+
+        return None
 
     def _load_traffic_signs(self, scene_data: SceneData, traffic_sign_file: Path) -> None:
         """Load traffic signs."""
