@@ -53,6 +53,132 @@ from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders.data_
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.camera.ftheta import FThetaCamera
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.laneline_utils import build_lane_line_type
 
+_DEFAULT_TRAFFIC_LIGHT_DIMENSIONS = np.array([0.6, 0.6, 1.0], dtype=np.float32)
+_IDENTITY_QUATERNION = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+
+def _traffic_light_signal_key(key: Any, light: Dict[str, Any]) -> str:
+    """Group parquet rows into one logical signal (label id preferred, else position)."""
+    if isinstance(key, dict):
+        label_id = key.get("label_class_id")
+        if label_id:
+            return f"id:{label_id}"
+    center = light["center"]
+    return (
+        f"pos:{round(center['x'], 3)},"
+        f"{round(center['y'], 3)},"
+        f"{round(center['z'], 3)}"
+    )
+
+
+def _parse_traffic_light_state(light: Dict[str, Any]) -> Optional[str]:
+    state = light.get("state")
+    if isinstance(state, str) and state.strip():
+        return state.strip()
+    return None
+
+
+def _hold_traffic_light_state_at_timestamp(
+    observations: List[Tuple[int, str]],
+    frame_timestamp_micros: int,
+) -> str:
+    """Return the state held at ``frame_timestamp_micros`` (latest obs at or before t)."""
+    held = observations[0][1]
+    for timestamp_micros, state in observations:
+        if timestamp_micros <= frame_timestamp_micros:
+            held = state
+        else:
+            break
+    return held
+
+
+def _build_traffic_light_state_sequence(
+    rows: List[Tuple[Any, Dict[str, Any]]],
+    frame_timestamps_micros: List[int],
+    num_frames: int,
+) -> Optional[List[str]]:
+    """Build per-frame state strings from one or more parquet rows for one signal."""
+    timestamped: List[Tuple[int, str]] = []
+    static_state: Optional[str] = None
+
+    for key, light in rows:
+        state = _parse_traffic_light_state(light)
+        if state is None:
+            continue
+
+        timestamp_micros: Optional[int] = None
+        if isinstance(key, dict):
+            raw_ts = key.get("timestamp_micros")
+            if raw_ts is not None:
+                timestamp_micros = int(raw_ts)
+
+        if timestamp_micros is not None:
+            timestamped.append((timestamp_micros, state))
+        elif static_state is None:
+            static_state = state
+
+    if len(timestamped) >= 2:
+        by_timestamp = dict(timestamped)
+        timestamped = sorted(by_timestamp.items())
+        if len(timestamped) >= 2:
+            if frame_timestamps_micros:
+                sample_timestamps = frame_timestamps_micros[:num_frames]
+            else:
+                t_min, t_max = timestamped[0][0], timestamped[-1][0]
+                if t_max <= t_min:
+                    representative = timestamped[-1][1]
+                    return [representative] * num_frames
+                sample_timestamps = [
+                    int(t_min + (t_max - t_min) * frame_idx / max(1, num_frames - 1))
+                    for frame_idx in range(num_frames)
+                ]
+            sequence = [
+                _hold_traffic_light_state_at_timestamp(timestamped, frame_ts)
+                for frame_ts in sample_timestamps
+            ]
+            while len(sequence) < num_frames:
+                sequence.append(sequence[-1])
+            return sequence[:num_frames]
+
+    representative = static_state
+    if representative is None and timestamped:
+        representative = timestamped[0][1]
+    if representative is None:
+        return None
+    return [representative] * num_frames
+
+
+def _traffic_light_geometry_from_row(
+    light: Dict[str, Any],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Parse center, dimensions, and orientation from one traffic-light parquet row."""
+    center = np.array(
+        [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
+        dtype=np.float32,
+    )
+
+    dimensions = _DEFAULT_TRAFFIC_LIGHT_DIMENSIONS.copy()
+    if "dimensions" in light:
+        dims = light["dimensions"]
+        if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
+            dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
+
+    orient = light["orientation"] if "orientation" in light else None
+    if orient is None or any(orient[k] is None for k in ("x", "y", "z", "w")):
+        orientation = _IDENTITY_QUATERNION.copy()
+    else:
+        orientation = np.array(
+            [orient["x"], orient["y"], orient["z"], orient["w"]],
+            dtype=np.float32,
+        )
+
+    if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
+        return None
+
+    center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
+    orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
+    return center, dimensions, orientation
+
 
 @auto_register(priority=10)  # High priority for ClipGT format
 class ClipGTLoader(SceneDataLoader):
@@ -933,61 +1059,59 @@ class ClipGTLoader(SceneDataLoader):
     def _load_traffic_lights(self, scene_data: SceneData, traffic_light_file: Path) -> None:
         """Load traffic lights, carrying each signal's color onto the light.
 
-        The parquet ``state`` column holds one representative color per signal
-        (e.g. "RED"/"YELLOW"/"GREEN"). It is broadcast across all frames via
-        ``metadata["state_sequence"]`` so the renderer colors the light; an
-        absent/empty state leaves the light UNKNOWN (gray). Orientation is
-        optional: a missing or null quaternion falls back to identity instead
-        of raising.
+        Parquet rows are grouped into one ``TrafficLight`` per signal
+        (``label_class_id`` when present, otherwise position). Sim-bag /
+        ScenarioNet parquets emit one row per signal with a representative
+        state, which is broadcast across all frames. SDS parquets emit many
+        timestamped rows per signal; those are folded into a per-frame
+        ``metadata["state_sequence"]`` aligned to ego pose timestamps.
         """
         df = pd.read_parquet(traffic_light_file)
 
         num_frames = max(1, scene_data.num_frames)
+        frame_timestamps_micros = [pose.timestamp for pose in scene_data.ego_poses]
 
-        for idx, row in df.iterrows():
+        groups: Dict[str, List[Tuple[Any, Dict[str, Any]]]] = defaultdict(list)
+        for _, row in df.iterrows():
+            key = row["key"] if "key" in row.index else {}
             light = cast(Dict[str, Any], row["traffic_light"])
+            groups[_traffic_light_signal_key(key, light)].append((key, light))
 
-            center = np.array(
-                [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
-                dtype=np.float32,
+        for group_idx, (signal_key, rows) in enumerate(groups.items()):
+            rows.sort(
+                key=lambda item: (
+                    item[0].get("timestamp_micros")
+                    if isinstance(item[0], dict) and item[0].get("timestamp_micros") is not None
+                    else -1
+                )
             )
 
-            dimensions = np.array([0.6, 0.6, 1.0], dtype=np.float32)  # Default
-            if "dimensions" in light:
-                dims = light["dimensions"]
-                if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
-                    dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
-
-            # Orientation is optional: a missing or null quaternion (e.g. signals
-            # from sources that record no facing) defaults to identity.
-            orient = light["orientation"] if "orientation" in light else None
-            if orient is None or any(orient[k] is None for k in ("x", "y", "z", "w")):
-                orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-            else:
-                orientation = np.array(
-                    [orient["x"], orient["y"], orient["z"], orient["w"]],
-                    dtype=np.float32,
-                )
-
-            if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
+            geometry: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+            for _, light in rows:
+                geometry = _traffic_light_geometry_from_row(light)
+                if geometry is not None:
+                    break
+            if geometry is None:
                 continue
-
-            center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
-            orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
+            center, dimensions, orientation = geometry
 
             traffic_light = TrafficLight(
-                element_id=f"traffic_light_{idx}",
+                element_id=f"traffic_light_{group_idx}",
                 center=center,
                 dimensions=dimensions,
                 orientation=orientation,
             )
 
-            # Carry the representative color onto the light. The renderer reads a
-            # per-frame sequence and pads (does not broadcast) a short one, so emit
-            # one entry per frame. An absent/empty state stays UNKNOWN (gray).
-            state = light["state"] if "state" in light else None
-            if isinstance(state, str) and state.strip():
-                traffic_light.metadata["state_sequence"] = [state] * num_frames
+            if signal_key.startswith("id:"):
+                traffic_light.metadata["feature_id"] = signal_key[3:]
+
+            state_sequence = _build_traffic_light_state_sequence(
+                rows,
+                frame_timestamps_micros,
+                num_frames,
+            )
+            if state_sequence is not None:
+                traffic_light.metadata["state_sequence"] = state_sequence
 
             scene_data.traffic_lights.append(traffic_light)
 
