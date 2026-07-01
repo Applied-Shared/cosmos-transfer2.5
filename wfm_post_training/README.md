@@ -34,7 +34,7 @@ When `conditioning_batch_id` and `caption_version` are set in the workload confi
 reads:
 
 ```
-finetuning_datasets/<conditioning_batch_id>.txt
+finetuning_datasets/<flyte_job_id>/<conditioning_batch_id>.txt
 ```
 
 Each non-empty line: `<segment_id> <annotation_hash> <control_bundle_id>`
@@ -91,7 +91,7 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 | `training_run_id` | `finetuning_runs.uuid` for this Lilypad submission; used as `job.name`, W&B run name, and local cache dir |
 | `manifest_bucket` | OCI bucket for training inputs |
 | `flyte_job_id` | Flyte campaign id (informational when submitted via WFM) |
-| `conditioning_batch_id` | Conditioning batch UUID; reads `finetuning_datasets/<conditioning_batch_id>.txt` |
+| `conditioning_batch_id` | Conditioning batch UUID; reads `finetuning_datasets/<flyte_job_id>/<conditioning_batch_id>.txt` |
 | `caption_version` | Caption version filename (required with `conditioning_batch_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
 | `manifest_key` | Legacy JSONL manifest key (use when `conditioning_batch_id` is unset) |
 | `output_bucket` / `output_prefix` | OCI destination for checkpoints and final `.pt` (`finetuning_jobs/<finetuning_run_id>/` when submitted via WFM) |

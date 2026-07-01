@@ -15,6 +15,7 @@ class LoadTrainingEntriesTest(unittest.TestCase):
     def test_should_load_finetuning_mapping_when_conditioning_batch_id_set(self) -> None:
         config = {
             "manifest_bucket": "sensor-sim-wfm",
+            "flyte_job_id": "flyte-abc",
             "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
             "caption_version": "cosmos-reason2-2b_prompts-v1",
         }
@@ -44,6 +45,7 @@ class LoadTrainingEntriesTest(unittest.TestCase):
         mock_download.assert_called_once_with(
             ANY,
             "sensor-sim-wfm",
+            "flyte-abc",
             "018f1234-5678-7abc-def0-123456789abc",
         )
         mock_convert.assert_called_once_with(
@@ -54,6 +56,7 @@ class LoadTrainingEntriesTest(unittest.TestCase):
     def test_should_accept_deprecated_caption_id_alias(self) -> None:
         config = {
             "manifest_bucket": "sensor-sim-wfm",
+            "flyte_job_id": "flyte-abc",
             "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
             "caption_id": "legacy-caption-v1",
         }
@@ -101,6 +104,7 @@ class LoadTrainingEntriesTest(unittest.TestCase):
     def test_should_require_caption_version_with_conditioning_batch_id(self) -> None:
         config = {
             "manifest_bucket": "sensor-sim-wfm",
+            "flyte_job_id": "flyte-abc",
             "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
         }
         with self.assertRaisesRegex(ValueError, "caption_version is required"):
@@ -113,6 +117,15 @@ class LoadTrainingEntriesTest(unittest.TestCase):
             "caption_version": "cosmos-reason2-2b_prompts-v1",
         }
         with self.assertRaisesRegex(ValueError, "conditioning_batch_id is required"):
+            _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
+
+    def test_should_require_flyte_job_id_with_conditioning_batch_id(self) -> None:
+        config = {
+            "manifest_bucket": "sensor-sim-wfm",
+            "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
+            "caption_version": "cosmos-reason2-2b_prompts-v1",
+        }
+        with self.assertRaisesRegex(ValueError, "flyte_job_id is required"):
             _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
 
     def test_should_require_conditioning_batch_id_or_manifest_key(self) -> None:
