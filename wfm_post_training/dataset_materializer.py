@@ -81,10 +81,10 @@ def load_finetuning_mapping(mapping_text: str) -> list[FinetuningMappingEntry]:
     return entries
 
 
-def finetuning_mapping_key(flyte_job_id: str) -> str:
-    """Return the OCI key for a finetuning campaign's segment-to-bundle mapping file."""
+def finetuning_mapping_key(flyte_job_id: str, conditioning_batch_id: str) -> str:
+    """Return the OCI key for a conditioning batch's segment-to-bundle mapping file."""
     return (
-        f"{FINETUNING_DATASETS_PREFIX}/{flyte_job_id}/segment_annotation_control_bundle.txt"
+        f"{FINETUNING_DATASETS_PREFIX}/{flyte_job_id}/{conditioning_batch_id}.txt"
     )
 
 
@@ -92,9 +92,10 @@ def download_finetuning_mapping(
     client: "boto3.client",
     bucket: str,
     flyte_job_id: str,
+    conditioning_batch_id: str,
 ) -> list[FinetuningMappingEntry]:
-    """Download and parse segment_annotation_control_bundle.txt from OCI."""
-    key = finetuning_mapping_key(flyte_job_id)
+    """Download and parse finetuning_datasets/<flyte_job_id>/<conditioning_batch_id>.txt from OCI."""
+    key = finetuning_mapping_key(flyte_job_id, conditioning_batch_id)
     with tempfile.NamedTemporaryFile(mode="w+b", suffix=".txt") as tmp:
         client.download_file(bucket, key, tmp.name)
         return load_finetuning_mapping(Path(tmp.name).read_text(encoding="utf-8"))

@@ -12,10 +12,11 @@ from wfm_post_training.lilypad_post_training_entrypoint import _load_training_en
 
 
 class LoadTrainingEntriesTest(unittest.TestCase):
-    def test_should_load_finetuning_mapping_when_flyte_job_id_set(self) -> None:
+    def test_should_load_finetuning_mapping_when_conditioning_batch_id_set(self) -> None:
         config = {
             "manifest_bucket": "sensor-sim-wfm",
             "flyte_job_id": "flyte-abc",
+            "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
             "caption_version": "cosmos-reason2-2b_prompts-v1",
         }
         mapping_entry = mock.Mock()
@@ -41,7 +42,12 @@ class LoadTrainingEntriesTest(unittest.TestCase):
 
         self.assertFalse(use_legacy)
         self.assertEqual(expected, entries)
-        mock_download.assert_called_once_with(ANY, "sensor-sim-wfm", "flyte-abc")
+        mock_download.assert_called_once_with(
+            ANY,
+            "sensor-sim-wfm",
+            "flyte-abc",
+            "018f1234-5678-7abc-def0-123456789abc",
+        )
         mock_convert.assert_called_once_with(
             [mapping_entry],
             "cosmos-reason2-2b_prompts-v1",
@@ -51,6 +57,7 @@ class LoadTrainingEntriesTest(unittest.TestCase):
         config = {
             "manifest_bucket": "sensor-sim-wfm",
             "flyte_job_id": "flyte-abc",
+            "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
             "caption_id": "legacy-caption-v1",
         }
         with mock.patch(
@@ -94,17 +101,39 @@ class LoadTrainingEntriesTest(unittest.TestCase):
             "post_training/run/manifest.jsonl",
         )
 
-    def test_should_require_caption_version_with_flyte_job_id(self) -> None:
+    def test_should_require_caption_version_with_conditioning_batch_id(self) -> None:
         config = {
             "manifest_bucket": "sensor-sim-wfm",
             "flyte_job_id": "flyte-abc",
+            "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
         }
         with self.assertRaisesRegex(ValueError, "caption_version is required"):
             _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
 
-    def test_should_require_flyte_job_id_or_manifest_key(self) -> None:
+    def test_should_reject_flyte_job_id_without_conditioning_batch_id(self) -> None:
+        config = {
+            "manifest_bucket": "sensor-sim-wfm",
+            "flyte_job_id": "flyte-abc",
+            "caption_version": "cosmos-reason2-2b_prompts-v1",
+        }
+        with self.assertRaisesRegex(ValueError, "conditioning_batch_id is required"):
+            _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
+
+    def test_should_require_flyte_job_id_with_conditioning_batch_id(self) -> None:
+        config = {
+            "manifest_bucket": "sensor-sim-wfm",
+            "conditioning_batch_id": "018f1234-5678-7abc-def0-123456789abc",
+            "caption_version": "cosmos-reason2-2b_prompts-v1",
+        }
+        with self.assertRaisesRegex(ValueError, "flyte_job_id is required"):
+            _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
+
+    def test_should_require_conditioning_batch_id_or_manifest_key(self) -> None:
         config = {"manifest_bucket": "sensor-sim-wfm"}
-        with self.assertRaisesRegex(ValueError, "either flyte_job_id or manifest_key"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "either conditioning_batch_id or manifest_key",
+        ):
             _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
 
 

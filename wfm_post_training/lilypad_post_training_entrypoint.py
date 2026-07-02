@@ -280,17 +280,22 @@ def _convert_and_upload_final_checkpoint(
 def _load_training_entries(config: dict, plain_client, worker_logger: logging.Logger):
     """Load manifest entries from finetuning mapping or legacy JSONL manifest."""
     manifest_bucket = config["manifest_bucket"]
+    conditioning_batch_id = (config.get("conditioning_batch_id") or "").strip()
     flyte_job_id = (config.get("flyte_job_id") or "").strip()
     manifest_key = (config.get("manifest_key") or "").strip()
 
-    if flyte_job_id:
+    if conditioning_batch_id:
+        if not flyte_job_id:
+            raise ValueError(
+                "flyte_job_id is required when conditioning_batch_id is set"
+            )
         caption_version = (config.get("caption_version") or config.get("caption_id") or "").strip()
         if not caption_version:
             raise ValueError(
-                "caption_version is required when flyte_job_id is set "
+                "caption_version is required when conditioning_batch_id is set "
                 "(caption_id is deprecated)"
             )
-        mapping_key = finetuning_mapping_key(flyte_job_id)
+        mapping_key = finetuning_mapping_key(flyte_job_id, conditioning_batch_id)
         worker_logger.info(
             "Downloading finetuning mapping s3://%s/%s",
             manifest_bucket,
@@ -300,17 +305,27 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
             plain_client,
             manifest_bucket,
             flyte_job_id,
+            conditioning_batch_id,
         )
         entries = finetuning_mapping_to_manifest_entries(mapping_entries, caption_version)
         worker_logger.info(
-            "Finetuning mapping contains %d entries (caption_version=%s)",
+            "Finetuning mapping contains %d entries (conditioning_batch_id=%s, caption_version=%s)",
             len(entries),
+            conditioning_batch_id,
             caption_version,
         )
         return entries, False
 
+    if flyte_job_id:
+        raise ValueError(
+            "conditioning_batch_id is required for finetuning mapping resolution; "
+            "flyte_job_id alone is no longer supported"
+        )
+
     if not manifest_key:
-        raise ValueError("either flyte_job_id or manifest_key is required")
+        raise ValueError(
+            "either conditioning_batch_id or manifest_key is required"
+        )
 
     worker_logger.info(
         "Downloading legacy manifest s3://%s/%s",
@@ -519,8 +534,8 @@ def run(config: dict) -> None:
         hf_cache_prefix:      prefix under hf_cache_bucket
 
     Input manifest — provide either:
-        flyte_job_id + caption_version: reads finetuning_datasets/<flyte_job_id>/
-            segment_annotation_control_bundle.txt and WFM canonical OCI paths
+        conditioning_batch_id + caption_version: reads
+            finetuning_datasets/<flyte_job_id>/<conditioning_batch_id>.txt and WFM canonical OCI paths
         manifest_key: legacy JSONL manifest at manifest_bucket/manifest_key
 
     Optional config keys:
