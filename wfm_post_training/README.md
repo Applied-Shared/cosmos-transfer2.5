@@ -167,22 +167,46 @@ Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to mat
 
 ## Building and pushing the Docker image
 
+1. Find the current image tag in applied3:
+
+   ```bash
+   grep docker_image applied3/adp/services/wfm/lilypad_workload_configs/cosmos_transfer_post_training.yaml
+   ```
+
+   The tag is the suffix after `sds:` (for example `cosmos_transfer2.5_v0.0.32`).
+
+2. Bump the patch version for your new build (for example `v0.0.32` → `v0.0.33`).
+
+3. Log in to OCIR before pushing:
+
+   Make sure you've docker logged in, for example:
+
+   ```bash
+   docker login us-phoenix-1.ocir.io -u idskhu5vqvtl/yun@applied.co
+   ```
+
+   Get an OCI auth token from OCI profile and paste it as the password when prompt.
+
+4. Build and push with the bumped tag:
+
 ```bash
 cd /home/yun/cosmos-transfer2.5
+
 docker build -f Dockerfile \
   --no-cache \
   --build-arg CUDA_NAME=cu128 \
   --build-arg STANDALONE=true \
-  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.27 .
+  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.<NN> .
 
-docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.27
+docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.<NN>
 ```
 
-Then update `docker_image` in `cosmos_transfer_post_training.yaml` (applied3) to
-`cosmos_transfer2.5_v0.0.27` or newer.
+   Use `--no-cache` when rebuilding after changing files under `wfm_post_training/`
+   so Ray head and GPU workers get the same code.
 
-Use `--no-cache` when rebuilding after changing files under `wfm_post_training/`
-so Ray head and GPU workers get the same code:
+5. Update `docker_image` in
+   `applied3/adp/services/wfm/lilypad_workload_configs/cosmos_transfer_post_training.yaml`
+   to the new tag.
 
 ## OCI S3-compat gotcha
 
