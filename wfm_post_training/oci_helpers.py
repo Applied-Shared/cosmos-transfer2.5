@@ -2,6 +2,8 @@
 
 import logging
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import boto3
@@ -16,6 +18,17 @@ OCI_BOTO_CONFIG = botocore.config.Config(
 )
 
 WORKER_CACHE_DIR = Path("/tmp/wfm_worker_cache")
+
+_THREAD_LOCAL = threading.local()
+
+
+def _worker_client() -> "boto3.client":
+    """Return a thread-local OCI client; boto3 clients are not thread-safe."""
+    client = getattr(_THREAD_LOCAL, "client", None)
+    if client is None:
+        client = make_plain_client()
+        _THREAD_LOCAL.client = client
+    return client
 
 
 def make_plain_client() -> "boto3.client":
@@ -160,14 +173,26 @@ def upload_directory(
     bucket: str,
     prefix: str,
     logger: logging.Logger,
+    *,
+    max_workers: int = 10,
 ) -> None:
     """Recursively upload local_dir to s3://bucket/prefix/."""
     prefix = prefix.rstrip("/")
     files = [p for p in sorted(local_dir.rglob("*")) if p.is_file()]
     logger.info("Uploading %d file(s) from %s to s3://%s/%s/", len(files), local_dir, bucket, prefix)
-    for path in files:
+
+    if max_workers <= 1:
+        for path in files:
+            key = f"{prefix}/{path.relative_to(local_dir)}".replace("\\", "/")
+            client.upload_file(str(path), bucket, key)
+        return
+
+    def _upload_one(path: Path) -> None:
         key = f"{prefix}/{path.relative_to(local_dir)}".replace("\\", "/")
-        client.upload_file(str(path), bucket, key)
+        upload_file(_worker_client(), path, bucket, key)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(executor.map(_upload_one, files))
 
 
 def download_directory(
