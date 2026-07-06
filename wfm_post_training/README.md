@@ -191,16 +191,14 @@ Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to mat
 
 ```bash
 cd /home/yun/cosmos-transfer2.5
-VERSION=cosmos_transfer2.5_v0.0.NN  # bump from step 1
-IMAGE=us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:${VERSION}
 
 docker build -f Dockerfile \
   --no-cache \
   --build-arg CUDA_NAME=cu128 \
   --build-arg STANDALONE=true \
-  -t "${IMAGE}" .
+  -t us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.<NN> .
 
-docker push "${IMAGE}"
+docker push us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds:cosmos_transfer2.5_v0.0.<NN>
 ```
 
    Use `--no-cache` when rebuilding after changing files under `wfm_post_training/`
