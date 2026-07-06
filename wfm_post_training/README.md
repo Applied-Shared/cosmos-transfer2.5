@@ -177,7 +177,17 @@ Update `training_run_id`, `manifest_key`, and `output_prefix` in the YAML to mat
 
 2. Bump the patch version for your new build (for example `v0.0.32` → `v0.0.33`).
 
-3. Build and push with the bumped tag:
+3. Log in to OCIR before pushing:
+
+   Make sure you've docker logged in, for example:
+
+   ```bash
+   docker login us-phoenix-1.ocir.io -u idskhu5vqvtl/yun@applied.co
+   ```
+
+   Get an OCI auth token from OCI profile and paste it as the password when prompt.
+
+4. Build and push with the bumped tag:
 
 ```bash
 cd /home/yun/cosmos-transfer2.5
@@ -196,7 +206,7 @@ docker push "${IMAGE}"
    Use `--no-cache` when rebuilding after changing files under `wfm_post_training/`
    so Ray head and GPU workers get the same code.
 
-4. Update `docker_image` in
+5. Update `docker_image` in
    `applied3/adp/services/wfm/lilypad_workload_configs/cosmos_transfer_post_training.yaml`
    to the new tag.
 
