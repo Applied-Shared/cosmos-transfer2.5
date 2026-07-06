@@ -279,7 +279,7 @@ def _convert_and_upload_final_checkpoint(
 
 def _load_training_entries(config: dict, plain_client, worker_logger: logging.Logger):
     """Load manifest entries from finetuning mapping or legacy JSONL manifest."""
-    manifest_bucket = config["manifest_bucket"]
+    input_bucket = config["input_bucket"]
     conditioning_batch_id = (config.get("conditioning_batch_id") or "").strip()
     flyte_job_id = (config.get("flyte_job_id") or "").strip()
     manifest_key = (config.get("manifest_key") or "").strip()
@@ -298,12 +298,12 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
         mapping_key = finetuning_mapping_key(flyte_job_id, conditioning_batch_id)
         worker_logger.info(
             "Downloading finetuning mapping s3://%s/%s",
-            manifest_bucket,
+            input_bucket,
             mapping_key,
         )
         mapping_entries = download_finetuning_mapping(
             plain_client,
-            manifest_bucket,
+            input_bucket,
             flyte_job_id,
             conditioning_batch_id,
         )
@@ -329,10 +329,10 @@ def _load_training_entries(config: dict, plain_client, worker_logger: logging.Lo
 
     worker_logger.info(
         "Downloading legacy manifest s3://%s/%s",
-        manifest_bucket,
+        input_bucket,
         manifest_key,
     )
-    entries = download_manifest(plain_client, manifest_bucket, manifest_key)
+    entries = download_manifest(plain_client, input_bucket, manifest_key)
     worker_logger.info("Manifest contains %d entries", len(entries))
     return entries, True
 
@@ -439,7 +439,7 @@ def _run_post_training_on_gpu(config: dict) -> None:
     )
     materialize_dataset(
         plain_client,
-        config["manifest_bucket"],
+        config["input_bucket"],
         entries,
         dataset_dir,
         use_legacy_sds_paths=use_legacy_sds_paths,
@@ -527,7 +527,7 @@ def run(config: dict) -> None:
 
     Required config keys:
         training_run_id:    unique run id; used as job.name and W&B run name
-        manifest_bucket:    OCI bucket containing training inputs
+        input_bucket:    OCI bucket containing training inputs
         output_bucket:        OCI bucket for checkpoints and final .pt uploads
         output_prefix:        prefix under output_bucket (e.g. post_training/run-001)
         hf_cache_bucket:      OCI bucket with pre-staged HF model cache
@@ -536,7 +536,7 @@ def run(config: dict) -> None:
     Input manifest — provide either:
         conditioning_batch_id + caption_version: reads
             finetuning_datasets/<flyte_job_id>/<conditioning_batch_id>.txt and WFM canonical OCI paths
-        manifest_key: legacy JSONL manifest at manifest_bucket/manifest_key
+        manifest_key: legacy JSONL manifest at input_bucket/manifest_key
 
     Optional config keys:
         checkpoint_bucket / checkpoint_key: base model .pt to cache locally (default base)
