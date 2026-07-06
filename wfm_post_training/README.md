@@ -89,7 +89,7 @@ Short camera folder names: `cross_left`, `cross_right`, `front_tele`, `front_wid
 | Key | Description |
 |-----|-------------|
 | `training_run_id` | `finetuning_runs.uuid` for this Lilypad submission; used as `job.name`, W&B run name, and local cache dir |
-| `manifest_bucket` | OCI bucket for training inputs |
+| `input_bucket` | OCI bucket for training inputs |
 | `flyte_job_id` | Flyte campaign id (informational when submitted via WFM) |
 | `conditioning_batch_id` | Conditioning batch UUID; reads `finetuning_datasets/<flyte_job_id>/<conditioning_batch_id>.txt` |
 | `caption_version` | Caption version filename (required with `conditioning_batch_id`), e.g. `cosmos-reason2-2b_prompts-v1` |
