@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,7 +18,7 @@ from wfm_post_training.camera_names import (
     oci_stem_aliases,
     short_camera_name,
 )
-from wfm_post_training.oci_helpers import download_file, object_exists
+from wfm_post_training.oci_helpers import download_file, make_plain_client, object_exists
 from wfm_post_training.video_utils import normalize_training_video_pair
 
 if TYPE_CHECKING:
@@ -386,6 +388,18 @@ def _materialize_sample(
     return True
 
 
+_THREAD_LOCAL = threading.local()
+
+
+def _worker_client() -> "boto3.client":
+    """Return a thread-local OCI client; boto3 clients are not thread-safe."""
+    client = getattr(_THREAD_LOCAL, "client", None)
+    if client is None:
+        client = make_plain_client()
+        _THREAD_LOCAL.client = client
+    return client
+
+
 def materialize_dataset(
     client: "boto3.client",
     bucket: str,
@@ -393,8 +407,9 @@ def materialize_dataset(
     dataset_dir: Path,
     *,
     use_legacy_sds_paths: bool = False,
+    max_workers: int = 10,
 ) -> MaterializeResult:
-    """Materialize all manifest entries into dataset_dir."""
+    """Materialize all manifest entries into dataset_dir in parallel."""
     for subdir in ("videos", "control_input_hdmap_bbox", "captions"):
         (dataset_dir / subdir).mkdir(parents=True, exist_ok=True)
     for short_name in SDS_CAMERA_SHORT_NAMES:
@@ -404,23 +419,54 @@ def materialize_dataset(
 
     valid = 0
     skipped = 0
-    for i, entry in enumerate(entries):
-        logger.info(
-            "Materializing sample %d/%d: control_bundle_id=%s",
-            i + 1,
-            len(entries),
-            entry.control_bundle_id,
-        )
-        if _materialize_sample(
-            client,
+    total = len(entries)
+
+    def _materialize_entry(entry: ManifestEntry) -> bool:
+        return _materialize_sample(
+            _worker_client(),
             bucket,
             entry,
             dataset_dir,
             use_legacy_sds_paths=use_legacy_sds_paths,
-        ):
-            valid += 1
-        else:
-            skipped += 1
+        )
+
+    if max_workers <= 1:
+        for i, entry in enumerate(entries):
+            logger.info(
+                "Materializing sample %d/%d: control_bundle_id=%s",
+                i + 1,
+                total,
+                entry.control_bundle_id,
+            )
+            if _materialize_sample(
+                client,
+                bucket,
+                entry,
+                dataset_dir,
+                use_legacy_sds_paths=use_legacy_sds_paths,
+            ):
+                valid += 1
+            else:
+                skipped += 1
+    else:
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_materialize_entry, entry): entry for entry in entries
+            }
+            for future in as_completed(futures):
+                entry = futures[future]
+                completed += 1
+                if future.result():
+                    valid += 1
+                else:
+                    skipped += 1
+                logger.info(
+                    "Materialized sample %d/%d: control_bundle_id=%s",
+                    completed,
+                    total,
+                    entry.control_bundle_id,
+                )
 
     if valid == 0:
         raise RuntimeError(
