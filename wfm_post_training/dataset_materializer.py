@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 CONTROL_BUNDLE_PREFIX = "control_bundles"
 RGB_PREFIX = "rgb/sds"
-CAPTIONS_PREFIX = "captions/rgb"
+CAPTIONS_PREFIX = "captions/sds"
 FINETUNING_DATASETS_PREFIX = "finetuning_datasets"
 # Legacy layout prefix; used only when use_legacy_sds_paths is True.
 SDS_PREFIX = "sds"
@@ -253,7 +253,7 @@ def _caption_key_candidates(
 ) -> list[str]:
     if use_legacy_sds_paths:
         return [f"{SDS_PREFIX}/{segment_id}/captions/{caption_version}"]
-    # Canonical: captions/rgb/<segment_id>/<camera_folder>/<caption_version>.json
+    # Canonical: captions/sds/<segment_id>/<camera_folder>/<caption_version>.json
     return [
         f"{CAPTIONS_PREFIX}/{segment_id}/{folder}/{caption_version}.json"
         for folder in CAPTION_SOURCE_FOLDERS

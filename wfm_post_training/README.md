@@ -45,7 +45,7 @@ OCI sources resolved per sample (WFM canonical layout):
 |-------|----------|
 | `control_bundle_id` | `control_bundles/<id>/` via `spec.json` or `cameras/*/bbox.mp4` |
 | `segment_id` | `rgb/sds/<segment_id>/{short_name\|ROG\|rig}.mp4` — tries lowercase short name first, then ROG names like `FRONT_CENTER`, then Cosmos rig names |
-| `caption_version` | `captions/rgb/<segment_id>/{front_wide\|FRONT_CENTER}/<caption_version>.json` |
+| `caption_version` | `captions/sds/<segment_id>/{front_wide\|FRONT_CENTER}/<caption_version>.json` |
 
 Example `caption_version`: `cosmos-reason2-2b_prompts-v1`
 

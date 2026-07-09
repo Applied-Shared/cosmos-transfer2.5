@@ -23,15 +23,15 @@ class FinetuningMappingKeyTest(unittest.TestCase):
 
 
 class CaptionKeyTest(unittest.TestCase):
-    def test_should_use_captions_rgb_prefix(self) -> None:
+    def test_should_use_captions_sds_prefix(self) -> None:
         self.assertEqual(
             _caption_key(
                 "seg-001",
                 "cosmos-reason2-2b_prompts-v1",
                 use_legacy_sds_paths=False,
             ),
-            "captions/rgb/seg-001/front_wide/cosmos-reason2-2b_prompts-v1.json",
-            "canonical captions live under captions/rgb/<segment_id>/",
+            "captions/sds/seg-001/front_wide/cosmos-reason2-2b_prompts-v1.json",
+            "canonical captions live under captions/sds/<segment_id>/",
         )
 
 
