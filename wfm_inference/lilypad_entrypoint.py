@@ -27,6 +27,27 @@ _OCI_BOTO_CONFIG = botocore.config.Config(
 # is not cleaned up between jobs.
 _WORKER_CACHE_DIR = Path("/tmp/wfm_worker_cache")
 
+# Subdirectory (under the per-job assets root) where ground-truth RGB videos are
+# staged. Kept distinct from the control bundle tree so RGB never collides with
+# a bundle file; spec.json input_path values are written relative to it.
+_RGB_SUBDIR = "_rgb"
+
+# Canonical short camera name (the spec.json key) -> the raw sensor stems the
+# RGB videos may be named with under rgb/sds/<segment_id>/. RGB is uploaded
+# under the raw sensor name (e.g. FRONT_CENTER.mp4), but the short name and the
+# NVIDIA rig stems are accepted as fallbacks. Mirrors
+# adp/services/wfm/async_job_runners/conditioning/core/bundle/camera_short_names.go
+# and adp/services/wfm/scripts/generate_overlay_videos.py.
+_SHORT_TO_RAW_CAMERA_STEMS: dict[str, list[str]] = {
+    "front_wide": ["FRONT_CENTER", "camera_front_wide_120fov", "front_wide"],
+    "front_tele": ["FRONT_CENTER_NARROW", "camera_front_tele_30fov", "front_tele"],
+    "cross_left": ["FRONT_LEFT", "camera_cross_left_120fov", "cross_left"],
+    "cross_right": ["FRONT_RIGHT", "camera_cross_right_120fov", "cross_right"],
+    "rear": ["REAR_CENTER", "camera_rear_tele_30fov", "rear"],
+    "rear_left": ["REAR_LEFT", "camera_rear_left_70fov", "rear_left"],
+    "rear_right": ["REAR_RIGHT", "camera_rear_right_70fov", "rear_right"],
+}
+
 
 def _apply_recipe_overrides(spec: dict, recipe_overrides: dict) -> None:
     """Apply recipe overrides from the WFM InferenceRecipe onto a spec.json dict in-place.
@@ -46,6 +67,66 @@ def _apply_recipe_overrides(spec: dict, recipe_overrides: dict) -> None:
             spec.pop("prompt_path", None)
         else:
             spec[key] = value
+
+
+def _download_rgb_inputs(
+    plain_client: "boto3.client",
+    rgb_bucket: str,
+    rgb_prefix: str,
+    assets_dir: Path,
+    logger: "logging.Logger",
+) -> dict[str, str]:
+    """Download the ground-truth RGB videos under rgb_prefix into assets_dir.
+
+    Returns a map of file stem (e.g. "FRONT_CENTER") to the downloaded file's
+    path relative to assets_dir, which is the form spec.json input_path values
+    take (they resolve against the spec file's directory).
+    """
+    rgb_root = assets_dir / _RGB_SUBDIR
+    stem_to_relpath: dict[str, str] = {}
+    paginator = plain_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=rgb_bucket, Prefix=rgb_prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            relative = key[len(rgb_prefix):].lstrip("/")
+            # Skip the prefix "directory" placeholder key some listings return.
+            if not relative:
+                continue
+            dest = rgb_root / relative
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            plain_client.download_file(rgb_bucket, key, str(dest))
+            stem_to_relpath[Path(relative).stem] = str(dest.relative_to(assets_dir))
+    logger.info(
+        "Downloaded %d RGB input video(s) from s3://%s/%s",
+        len(stem_to_relpath), rgb_bucket, rgb_prefix,
+    )
+    return stem_to_relpath
+
+
+def _inject_rgb_input_paths(
+    spec: dict,
+    stem_to_relpath: dict[str, str],
+    logger: "logging.Logger",
+) -> None:
+    """Set input_path on each active camera in spec to its downloaded RGB video.
+
+    Only cameras that already carry a control_path are touched (those are the
+    views the model treats as active). A camera with no matching RGB file is
+    left control-only and logged; if the recipe requested conditioning frames
+    the model will then fail validation loudly rather than silently drop the
+    condition.
+    """
+    for short_name, raw_stems in _SHORT_TO_RAW_CAMERA_STEMS.items():
+        camera = spec.get(short_name)
+        if not isinstance(camera, dict) or "control_path" not in camera:
+            continue
+        matched = next((s for s in raw_stems if s in stem_to_relpath), None)
+        if matched is None:
+            logger.warning(
+                "No RGB input video found for camera %s; leaving it control-only", short_name,
+            )
+            continue
+        camera["input_path"] = stem_to_relpath[matched]
 
 
 def _remap_hf_snapshot(
@@ -214,6 +295,10 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
         output_prefix = job["output_prefix"]
         spec_json = job.get("spec_json", "spec.json")
         recipe_overrides = job.get("recipe_overrides", {})
+        # Present only when the recipe requested RGB conditioning frames; the
+        # RGB videos live outside the control bundle (rgb/sds/<segment_id>/).
+        rgb_bucket = job.get("rgb_bucket")
+        rgb_prefix = job.get("rgb_prefix")
 
         logger.info("Job %d/%d: s3://%s/%s -> s3://%s/%s",
                     i + 1, len(jobs), input_bucket, input_prefix, output_bucket, output_prefix)
@@ -233,14 +318,27 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     plain_client.download_file(input_bucket, key, str(dest))
 
-            if recipe_overrides:
+            has_rgb = bool(rgb_bucket and rgb_prefix)
+            if recipe_overrides or has_rgb:
                 spec_path = assets_dir / spec_json
                 with open(spec_path) as f:
                     spec_data = json.load(f)
-                _apply_recipe_overrides(spec_data, recipe_overrides)
+                if recipe_overrides:
+                    _apply_recipe_overrides(spec_data, recipe_overrides)
+                # Stage RGB and wire input_path after overrides so per-camera
+                # conditioning counts (which may create camera entries) are
+                # already in place when we decide which views are active.
+                if has_rgb:
+                    stem_to_relpath = _download_rgb_inputs(
+                        plain_client, rgb_bucket, rgb_prefix, assets_dir, logger,
+                    )
+                    _inject_rgb_input_paths(spec_data, stem_to_relpath, logger)
                 with open(spec_path, "w") as f:
                     json.dump(spec_data, f, indent=2)
-                logger.info("Applied recipe overrides to %s", spec_json)
+                logger.info(
+                    "Updated %s (recipe_overrides=%s, rgb_conditioning=%s)",
+                    spec_json, bool(recipe_overrides), has_rgb,
+                )
 
             cmd = [
                 "torchrun",
@@ -307,6 +405,13 @@ def run(config: dict) -> None:
         output_prefix:      prefix under which outputs will be written
         spec_json:          spec file path relative to assets root
                             (default: multiview_spec.json)
+        rgb_bucket:         OCI bucket holding the ground-truth RGB videos to
+                            condition on (optional; RGB conditioning only)
+        rgb_prefix:         prefix under which the per-camera RGB videos live,
+                            e.g. rgb/sds/<segment_id> (optional). When both
+                            rgb_bucket and rgb_prefix are set, the RGB videos
+                            are staged and wired into spec.json as per-camera
+                            input_path values.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
