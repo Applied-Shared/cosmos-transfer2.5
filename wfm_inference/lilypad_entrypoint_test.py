@@ -24,6 +24,45 @@ def test_short_to_raw_camera_stems_covers_all_multiview_cameras() -> None:
     assert set(lilypad_entrypoint._SHORT_TO_RAW_CAMERA_STEMS) == set(MULTIVIEW_CAMERA_KEYS)
 
 
+class _FakePlainClient:
+    """Minimal boto3-style stub: lists a fixed key set and writes empty files."""
+
+    def __init__(self, keys: list[str]) -> None:
+        self._keys = keys
+
+    def get_paginator(self, _name: str) -> "_FakePlainClient._Paginator":
+        return _FakePlainClient._Paginator(self._keys)
+
+    def download_file(self, _bucket: str, _key: str, dest: str) -> None:
+        with open(dest, "wb") as f:
+            f.write(b"")
+
+    class _Paginator:
+        def __init__(self, keys: list[str]) -> None:
+            self._keys = keys
+
+        def paginate(self, Bucket: str, Prefix: str):  # noqa: N803
+            yield {"Contents": [{"Key": k} for k in self._keys]}
+
+
+def test_download_rgb_inputs_stages_relative_to_spec_dir(tmp_path) -> None:
+    # Precondition: the spec file lives in a nested subdirectory, not at the
+    # assets root — multiview resolves input_path against the spec's directory.
+    spec_dir = tmp_path / "assets" / "nested"
+    spec_dir.mkdir(parents=True)
+    client = _FakePlainClient(["rgb/sds/seg/FRONT_CENTER.mp4"])
+
+    # Under test.
+    stem_to_relpath = lilypad_entrypoint._download_rgb_inputs(
+        client, "bucket", "rgb/sds/seg/", spec_dir, _LOGGER,
+    )
+
+    # Postcondition: paths are relative to the spec dir and the file is staged
+    # there, so inference finds it after chdir to the spec's directory.
+    assert stem_to_relpath == {"FRONT_CENTER": "_rgb/FRONT_CENTER.mp4"}
+    assert (spec_dir / "_rgb" / "FRONT_CENTER.mp4").is_file()
+
+
 def test_inject_rgb_input_paths_sets_input_path_for_active_cameras() -> None:
     # Precondition: front_wide has a control_path and a matching raw RGB stem.
     spec = {

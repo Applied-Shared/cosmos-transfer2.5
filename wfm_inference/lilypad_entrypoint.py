@@ -27,9 +27,11 @@ _OCI_BOTO_CONFIG = botocore.config.Config(
 # is not cleaned up between jobs.
 _WORKER_CACHE_DIR = Path("/tmp/wfm_worker_cache")
 
-# Subdirectory (under the per-job assets root) where ground-truth RGB videos are
+# Subdirectory (alongside the spec.json file) where ground-truth RGB videos are
 # staged. Kept distinct from the control bundle tree so RGB never collides with
-# a bundle file; spec.json input_path values are written relative to it.
+# a bundle file. Staged next to the spec file (not the assets root) because
+# multiview resolves input_path relative to the spec file's directory, and the
+# spec need not sit at the assets root.
 _RGB_SUBDIR = "_rgb"
 
 # Canonical short camera name (the spec.json key) -> the raw sensor stems the
@@ -73,16 +75,21 @@ def _download_rgb_inputs(
     plain_client: "boto3.client",
     rgb_bucket: str,
     rgb_prefix: str,
-    assets_dir: Path,
+    spec_dir: Path,
     logger: "logging.Logger",
 ) -> dict[str, str]:
-    """Download the ground-truth RGB videos under rgb_prefix into assets_dir.
+    """Download the ground-truth RGB videos under rgb_prefix next to the spec.
+
+    spec_dir is the directory that holds the spec.json file. Videos are staged
+    into spec_dir/_RGB_SUBDIR and the returned relative paths are computed
+    against spec_dir, because multiview resolves input_path relative to the
+    spec file's directory (which need not be the assets root).
 
     Returns a map of file stem (e.g. "FRONT_CENTER") to the downloaded file's
-    path relative to assets_dir, which is the form spec.json input_path values
-    take (they resolve against the spec file's directory).
+    path relative to spec_dir, which is the form spec.json input_path values
+    take.
     """
-    rgb_root = assets_dir / _RGB_SUBDIR
+    rgb_root = spec_dir / _RGB_SUBDIR
     stem_to_relpath: dict[str, str] = {}
     paginator = plain_client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=rgb_bucket, Prefix=rgb_prefix):
@@ -95,7 +102,7 @@ def _download_rgb_inputs(
             dest = rgb_root / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
             plain_client.download_file(rgb_bucket, key, str(dest))
-            stem_to_relpath[Path(relative).stem] = str(dest.relative_to(assets_dir))
+            stem_to_relpath[Path(relative).stem] = str(dest.relative_to(spec_dir))
     logger.info(
         "Downloaded %d RGB input video(s) from s3://%s/%s",
         len(stem_to_relpath), rgb_bucket, rgb_prefix,
@@ -330,7 +337,7 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
                 # already in place when we decide which views are active.
                 if has_rgb:
                     stem_to_relpath = _download_rgb_inputs(
-                        plain_client, rgb_bucket, rgb_prefix, assets_dir, logger,
+                        plain_client, rgb_bucket, rgb_prefix, spec_path.parent, logger,
                     )
                     _inject_rgb_input_paths(spec_data, stem_to_relpath, logger)
                 with open(spec_path, "w") as f:
