@@ -300,8 +300,8 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
     experiment = base_config["experiment"]
 
     for i, job in enumerate(jobs):
-        input_bucket = job["input_bucket"]
-        input_prefix = job["input_prefix"]
+        control_bucket = job["control_bucket"]
+        control_prefix = job["control_prefix"]
         output_bucket = job["output_bucket"]
         output_prefix = job["output_prefix"]
         spec_json = job.get("spec_json", "spec.json")
@@ -312,7 +312,7 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
         rgb_prefix = job.get("rgb_prefix")
 
         logger.info("Job %d/%d: s3://%s/%s -> s3://%s/%s",
-                    i + 1, len(jobs), input_bucket, input_prefix, output_bucket, output_prefix)
+                    i + 1, len(jobs), control_bucket, control_prefix, output_bucket, output_prefix)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             work = Path(tmpdir)
@@ -321,13 +321,13 @@ def _run_batch_on_gpu(base_config: dict, jobs: list[dict]) -> None:
             output_dir.mkdir(parents=True)
 
             paginator = plain_client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=input_bucket, Prefix=input_prefix):
+            for page in paginator.paginate(Bucket=control_bucket, Prefix=control_prefix):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
-                    relative = key[len(input_prefix):].lstrip("/")
+                    relative = key[len(control_prefix):].lstrip("/")
                     dest = assets_dir / relative
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    plain_client.download_file(input_bucket, key, str(dest))
+                    plain_client.download_file(control_bucket, key, str(dest))
 
             has_rgb = bool(rgb_bucket and rgb_prefix)
             if recipe_overrides or has_rgb:
@@ -410,8 +410,8 @@ def run(config: dict) -> None:
         num_gpus:           number of GPUs to use (default: 8)
 
     Per-job keys (under the jobs list, or at top level for a single job):
-        input_bucket:      OCI bucket containing input assets
-        input_prefix:      prefix under which the assets/ tree is stored
+        control_bucket:     OCI bucket containing the control bundle assets
+        control_prefix:     prefix under which the assets/ tree is stored
         output_bucket:      OCI bucket to upload inference outputs to
         output_prefix:      prefix under which outputs will be written
         spec_json:          spec file path relative to assets root
@@ -434,8 +434,8 @@ def run(config: dict) -> None:
     else:
         # Single-job flat format for backward compatibility.
         job = {
-            "input_bucket": config["input_bucket"],
-            "input_prefix": config["input_prefix"],
+            "control_bucket": config["control_bucket"],
+            "control_prefix": config["control_prefix"],
             "output_bucket": config["output_bucket"],
             "output_prefix": config["output_prefix"],
             "spec_json": config.get("spec_json", "spec.json"),
