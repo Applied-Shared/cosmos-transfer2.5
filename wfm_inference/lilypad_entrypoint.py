@@ -118,10 +118,10 @@ def _inject_rgb_input_paths(
     """Set input_path on each active camera in spec to its downloaded RGB video.
 
     Only cameras that already carry a control_path are touched (those are the
-    views the model treats as active). A camera with no matching RGB file is
-    left control-only and logged; if the recipe requested conditioning frames
-    the model will then fail validation loudly rather than silently drop the
-    condition.
+    views the model treats as active). A camera with no matching RGB file has
+    any stale input_path cleared and is left control-only and logged; if the
+    recipe requested conditioning frames the model will then fail validation
+    loudly rather than silently conditioning on a leftover bundled path.
     """
     for short_name, raw_stems in _SHORT_TO_RAW_CAMERA_STEMS.items():
         camera = spec.get(short_name)
@@ -129,6 +129,10 @@ def _inject_rgb_input_paths(
             continue
         matched = next((s for s in raw_stems if s in stem_to_relpath), None)
         if matched is None:
+            # Drop any input_path the bundled spec shipped with so a missing
+            # ground-truth RGB fails validation loudly instead of silently
+            # conditioning on a stale path.
+            camera.pop("input_path", None)
             logger.warning(
                 "No RGB input video found for camera %s; leaving it control-only", short_name,
             )
@@ -429,13 +433,20 @@ def run(config: dict) -> None:
         base_config = {k: v for k, v in config.items() if k != "jobs"}
     else:
         # Single-job flat format for backward compatibility.
-        jobs = [{
+        job = {
             "input_bucket": config["input_bucket"],
             "input_prefix": config["input_prefix"],
             "output_bucket": config["output_bucket"],
             "output_prefix": config["output_prefix"],
             "spec_json": config.get("spec_json", "spec.json"),
-        }]
+        }
+        # RGB conditioning is optional; carry the top-level keys through so the
+        # flat format supports it too (the docstring advertises these as usable
+        # at top level for a single job).
+        for optional_key in ("rgb_bucket", "rgb_prefix", "recipe_overrides"):
+            if optional_key in config:
+                job[optional_key] = config[optional_key]
+        jobs = [job]
         base_config = config
 
     ray.init(address="auto")

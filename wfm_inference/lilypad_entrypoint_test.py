@@ -102,6 +102,22 @@ def test_inject_rgb_input_paths_leaves_camera_control_only_when_no_rgb() -> None
     assert "input_path" not in spec["rear"]
 
 
+def test_inject_rgb_input_paths_clears_stale_input_path_when_no_rgb() -> None:
+    # A camera whose bundled spec already carries an input_path but has no
+    # matching staged RGB must have that stale path cleared, so the model fails
+    # validation loudly rather than conditioning on a leftover bundled path.
+    spec = {
+        "rear": {
+            "control_path": "controls/rear.mp4",
+            "input_path": "stale/rear.mp4",
+        }
+    }
+
+    lilypad_entrypoint._inject_rgb_input_paths(spec, {}, _LOGGER)
+
+    assert "input_path" not in spec["rear"]
+
+
 def test_inject_rgb_input_paths_ignores_cameras_without_control_path() -> None:
     # Non-camera keys and cameras without a control_path (inactive views) must
     # never receive an input_path.
