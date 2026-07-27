@@ -7,8 +7,13 @@ import unittest
 from unittest import mock
 from unittest.mock import ANY
 
+from pathlib import Path
+
 from wfm_post_training.dataset_materializer import ManifestEntry
-from wfm_post_training.lilypad_post_training_entrypoint import _load_training_entries
+from wfm_post_training.lilypad_post_training_entrypoint import (
+    _build_train_cmd,
+    _load_training_entries,
+)
 
 
 class LoadTrainingEntriesTest(unittest.TestCase):
@@ -135,6 +140,51 @@ class LoadTrainingEntriesTest(unittest.TestCase):
             "either conditioning_batch_id or manifest_key",
         ):
             _load_training_entries(config, mock.Mock(), logging.getLogger("test"))
+
+
+class BuildTrainCmdTest(unittest.TestCase):
+    def _base_config(self) -> dict:
+        return {"experiment": "exp", "data_train": "data", "num_gpus": 8}
+
+    def test_should_omit_optional_overrides_when_unset(self) -> None:
+        cmd = _build_train_cmd(
+            self._base_config(),
+            Path("/tmp/ds"),
+            "run-1",
+            resume_path=None,
+        )
+        joined = " ".join(cmd)
+        self.assertIn("trainer.max_iter=5000", cmd)
+        self.assertIn("checkpoint.save_iter=200", cmd)
+        for absent in (
+            "trainer.grad_accum_iter",
+            "scheduler.warm_up_steps",
+            "optimizer.lr",
+            "every_n_sample_reg.every_n",
+            "every_n_sample_ema.every_n",
+        ):
+            self.assertNotIn(absent, joined)
+
+    def test_should_append_optional_overrides_when_set(self) -> None:
+        config = self._base_config()
+        config.update(
+            {
+                "max_iter": 8000,
+                "save_iter": 500,
+                "grad_accum_iter": 4,
+                "warmup_steps": 500,
+                "learning_rate": 3e-5,
+                "sample_every_n": 1000,
+            }
+        )
+        cmd = _build_train_cmd(config, Path("/tmp/ds"), "run-1", resume_path=None)
+        self.assertIn("trainer.max_iter=8000", cmd)
+        self.assertIn("checkpoint.save_iter=500", cmd)
+        self.assertIn("trainer.grad_accum_iter=4", cmd)
+        self.assertIn("scheduler.warm_up_steps=[500]", cmd)
+        self.assertIn("optimizer.lr=3e-05", cmd)
+        self.assertIn("trainer.callbacks.every_n_sample_reg.every_n=1000", cmd)
+        self.assertIn("trainer.callbacks.every_n_sample_ema.every_n=1000", cmd)
 
 
 if __name__ == "__main__":
