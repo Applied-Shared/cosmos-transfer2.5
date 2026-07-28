@@ -162,6 +162,7 @@ class BuildTrainCmdTest(unittest.TestCase):
             "optimizer.lr",
             "every_n_sample_reg.every_n",
             "every_n_sample_ema.every_n",
+            "grad_clip.clip_norm",
         ):
             self.assertNotIn(absent, joined)
 
@@ -175,6 +176,7 @@ class BuildTrainCmdTest(unittest.TestCase):
                 "warmup_steps": 500,
                 "learning_rate": 3e-5,
                 "sample_every_n": 1000,
+                "clip_norm": 1.0,
             }
         )
         cmd = _build_train_cmd(config, Path("/tmp/ds"), "run-1", resume_path=None)
@@ -185,6 +187,7 @@ class BuildTrainCmdTest(unittest.TestCase):
         self.assertIn("optimizer.lr=3e-05", cmd)
         self.assertIn("trainer.callbacks.every_n_sample_reg.every_n=1000", cmd)
         self.assertIn("trainer.callbacks.every_n_sample_ema.every_n=1000", cmd)
+        self.assertIn("trainer.callbacks.grad_clip.clip_norm=1.0", cmd)
 
 
 if __name__ == "__main__":

@@ -239,6 +239,9 @@ def _build_train_cmd(
     if sample_every_n is not None:
         cmd.append(f"trainer.callbacks.every_n_sample_reg.every_n={sample_every_n}")
         cmd.append(f"trainer.callbacks.every_n_sample_ema.every_n={sample_every_n}")
+    clip_norm = config.get("clip_norm")
+    if clip_norm is not None:
+        cmd.append(f"trainer.callbacks.grad_clip.clip_norm={clip_norm}")
 
     if resume_path is not None:
         cmd.append(f"checkpoint.load_path={resume_path}")
@@ -570,6 +573,8 @@ def run(config: dict) -> None:
             (default: experiment config value)
         sample_every_n:       validation-sample frequency -> trainer.callbacks
             .every_n_sample_reg/ema.every_n (default: experiment config value)
+        clip_norm:            gradient-clipping max norm ->
+            trainer.callbacks.grad_clip.clip_norm (default: experiment config value)
         resume_from_oci:      download latest OCI checkpoint before training (default false)
         checkpoint_load_path: override initial checkpoint.load_path (local path or URI)
         debug_upload_materialized_dataset: TEMP — upload dataset_dir to
