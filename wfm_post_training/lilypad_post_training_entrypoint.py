@@ -566,15 +566,16 @@ def run(config: dict) -> None:
         max_iter:             training iterations (default 5000)
         save_iter:            checkpoint save frequency (default 200)
         grad_accum_iter:      gradient accumulation steps -> trainer.grad_accum_iter
-            (default: experiment config value)
+            (only appended when present; otherwise the experiment config default applies)
         warmup_steps:         LR warmup steps -> scheduler.warm_up_steps=[N]
-            (default: experiment config value)
+            (only appended when present; otherwise the experiment config default applies)
         learning_rate:        learning rate -> optimizer.lr
-            (default: experiment config value)
+            (only appended when present; otherwise the experiment config default applies)
         sample_every_n:       validation-sample frequency -> trainer.callbacks
-            .every_n_sample_reg/ema.every_n (default: experiment config value)
-        clip_norm:            gradient-clipping max norm ->
-            trainer.callbacks.grad_clip.clip_norm (default: experiment config value)
+            .every_n_sample_reg/ema.every_n
+            (only appended when present; otherwise the experiment config default applies)
+        clip_norm:            gradient-clipping max norm -> trainer.callbacks.grad_clip.clip_norm
+            (only appended when present; otherwise the experiment config default applies)
         resume_from_oci:      download latest OCI checkpoint before training (default false)
         checkpoint_load_path: override initial checkpoint.load_path (local path or URI)
         debug_upload_materialized_dataset: TEMP — upload dataset_dir to
