@@ -223,6 +223,26 @@ def _build_train_cmd(
         f"checkpoint.save_iter={save_iter}",
     ]
 
+    # Optional training-hyperparameter overrides. Each is appended only when the
+    # caller set it so the experiment config default stays authoritative otherwise.
+    grad_accum_iter = config.get("grad_accum_iter")
+    if grad_accum_iter is not None:
+        cmd.append(f"trainer.grad_accum_iter={grad_accum_iter}")
+    warmup_steps = config.get("warmup_steps")
+    if warmup_steps is not None:
+        # scheduler.warm_up_steps is a list in the experiment config.
+        cmd.append(f"scheduler.warm_up_steps=[{warmup_steps}]")
+    learning_rate = config.get("learning_rate")
+    if learning_rate is not None:
+        cmd.append(f"optimizer.lr={learning_rate}")
+    sample_every_n = config.get("sample_every_n")
+    if sample_every_n is not None:
+        cmd.append(f"trainer.callbacks.every_n_sample_reg.every_n={sample_every_n}")
+        cmd.append(f"trainer.callbacks.every_n_sample_ema.every_n={sample_every_n}")
+    clip_norm = config.get("clip_norm")
+    if clip_norm is not None:
+        cmd.append(f"trainer.callbacks.grad_clip.clip_norm={clip_norm}")
+
     if resume_path is not None:
         cmd.append(f"checkpoint.load_path={resume_path}")
         cmd.append("checkpoint.load_training_state=True")
@@ -545,6 +565,17 @@ def run(config: dict) -> None:
         num_gpus:             GPUs to use (default 8)
         max_iter:             training iterations (default 5000)
         save_iter:            checkpoint save frequency (default 200)
+        grad_accum_iter:      gradient accumulation steps -> trainer.grad_accum_iter
+            (only appended when present; otherwise the experiment config default applies)
+        warmup_steps:         LR warmup steps -> scheduler.warm_up_steps=[N]
+            (only appended when present; otherwise the experiment config default applies)
+        learning_rate:        learning rate -> optimizer.lr
+            (only appended when present; otherwise the experiment config default applies)
+        sample_every_n:       validation-sample frequency -> trainer.callbacks
+            .every_n_sample_reg/ema.every_n
+            (only appended when present; otherwise the experiment config default applies)
+        clip_norm:            gradient-clipping max norm -> trainer.callbacks.grad_clip.clip_norm
+            (only appended when present; otherwise the experiment config default applies)
         resume_from_oci:      download latest OCI checkpoint before training (default false)
         checkpoint_load_path: override initial checkpoint.load_path (local path or URI)
         debug_upload_materialized_dataset: TEMP — upload dataset_dir to
