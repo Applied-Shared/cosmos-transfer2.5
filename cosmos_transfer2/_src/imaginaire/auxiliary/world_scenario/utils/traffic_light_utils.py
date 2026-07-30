@@ -16,6 +16,7 @@ Following the pattern from cosmos-av-sample-toolkits.
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -76,6 +77,44 @@ def prepare_traffic_light_status_data_clipgt(
     return traffic_lights, None, tl_status_to_rgb
 
 
+def compute_traffic_light_facing_mask(
+    centers: List[np.ndarray],
+    normals: List[np.ndarray],
+    orientation_known: List[bool],
+    camera_position: np.ndarray,
+    cutoff_deg: float,
+) -> Optional[List[bool]]:
+    """Per-head keep mask for the per-camera traffic-light facing cull.
+
+    A head is kept for a camera when the camera lies within ``cutoff_deg`` of the
+    head's lit-lens normal (i.e. it faces the camera); a head whose lens points away
+    would only show its dark housing back and is culled. Heads whose orientation is
+    unknown are always kept, since their facing cannot be determined. Returns
+    ``None`` (no cull) when ``cutoff_deg <= 0`` or there are no heads.
+
+    Args:
+        centers: Per-head world-frame centers.
+        normals: Per-head lit-lens normals, same world frame as ``camera_position``.
+        orientation_known: Per-head flags; False keeps the head regardless of facing.
+        camera_position: Camera position in the world frame (3-vector).
+        cutoff_deg: Facing half-angle cutoff in degrees; <= 0 disables the cull.
+    """
+    if cutoff_deg <= 0 or not normals:
+        return None
+    cos_cutoff = math.cos(math.radians(cutoff_deg))
+    camera_position = np.asarray(camera_position, dtype=np.float64)
+    mask: List[bool] = []
+    for center, normal, known in zip(centers, normals, orientation_known):
+        if not known:
+            mask.append(True)
+            continue
+        view = camera_position - np.asarray(center, dtype=np.float64)
+        denom = float(np.linalg.norm(view) * np.linalg.norm(normal))
+        cos_angle = float(np.dot(normal, view) / denom) if denom > 0 else 1.0
+        mask.append(cos_angle >= cos_cutoff)
+    return mask
+
+
 def create_traffic_light_status_geometry_objects_from_data(
     traffic_light_position_list: List[np.ndarray],
     traffic_light_per_frame_status_dict: Optional[Dict],
@@ -83,6 +122,7 @@ def create_traffic_light_status_geometry_objects_from_data(
     camera_pose: np.ndarray,
     camera_model: Any,  # Camera model instance (FThetaCamera or similar)
     tl_status_to_rgb: Dict,
+    facing_ok: Optional[List[bool]] = None,
 ) -> List[Polygon2D]:
     """
     Build geometry objects (Polygon2D) for traffic lights for a single frame.
@@ -97,6 +137,9 @@ def create_traffic_light_status_geometry_objects_from_data(
         camera_pose: Camera pose matrix (4x4)
         camera_model: Camera model
         tl_status_to_rgb: Mapping from status to RGB values
+        facing_ok: Optional per-head mask; when provided, heads whose entry is False
+            are skipped for this camera (their lit lens faces away from it). None
+            keeps every head (no facing cull).
 
     Returns:
         List of Polygon2D objects for traffic lights
@@ -104,10 +147,20 @@ def create_traffic_light_status_geometry_objects_from_data(
     if not traffic_light_position_list:
         return []
 
+    if facing_ok is not None and len(facing_ok) != len(traffic_light_position_list):
+        raise ValueError(
+            f"facing_ok length {len(facing_ok)} does not match traffic-light count "
+            f"{len(traffic_light_position_list)}"
+        )
+
     polygon_vertices = []
     polygon_colors = []
 
     for traffic_light_index, tl_polyline in enumerate(traffic_light_position_list):
+        # Per-camera facing cull: skip heads whose lit lens points away from this
+        # camera (it would image only their dark housing back).
+        if facing_ok is not None and not facing_ok[traffic_light_index]:
+            continue
         if traffic_light_per_frame_status_dict is None:
             # Use unknown color for traffic light without status
             # This is exactly what cosmos-av-sample-toolkits does

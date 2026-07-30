@@ -977,15 +977,18 @@ class ClipGTLoader(SceneDataLoader):
                     dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
 
             # Orientation is optional: a missing or null quaternion (e.g. signals
-            # from sources that record no facing) defaults to identity.
+            # from sources that record no facing) defaults to identity. Record
+            # whether it was known so downstream consumers (e.g. the renderer's
+            # facing cull) don't treat the identity placeholder as a real facing.
             orient = light["orientation"] if "orientation" in light else None
-            if orient is None or any(orient[k] is None for k in ("x", "y", "z", "w")):
-                orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-            else:
+            orientation_known = orient is not None and all(orient[k] is not None for k in ("x", "y", "z", "w"))
+            if orientation_known:
                 orientation = np.array(
                     [orient["x"], orient["y"], orient["z"], orient["w"]],
                     dtype=np.float32,
                 )
+            else:
+                orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
             if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
                 continue
@@ -999,6 +1002,7 @@ class ClipGTLoader(SceneDataLoader):
                 dimensions=dimensions,
                 orientation=orientation,
             )
+            traffic_light.metadata["orientation_known"] = orientation_known
 
             # Build the per-frame color sequence. Timestamped observations step
             # through colors aligned to the frame grid (hold-last); a single

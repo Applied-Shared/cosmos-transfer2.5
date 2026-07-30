@@ -52,12 +52,24 @@ from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.pcd_utils i
     triangulate_polygon_3d,
 )
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.traffic_light_utils import (
+    compute_traffic_light_facing_mask,
     create_traffic_light_status_geometry_objects_from_data,
     load_traffic_light_colors,
 )
 
 if TYPE_CHECKING:
     from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.data_types import SceneData, TrafficLight
+
+
+# A traffic-light lens only shows its color to a camera roughly in front of it; a head
+# facing away shows its dark housing back. In a multi-camera render, a head that faces
+# one camera (e.g. front) is often back-facing another (e.g. rear), so drawing its lit
+# color into every camera paints a signal on a back the camera actually images. Per
+# camera, cull a head when the angle between its lit-lens normal and the head->camera
+# direction exceeds this cutoff. The facing distribution is bimodal -- genuine facers
+# well under, back-facers well over -- so 90 degrees sits in the gap with margin. Set
+# <= 0 to disable the cull.
+TRAFFIC_LIGHT_FACING_CULL_DEG = 90.0
 
 
 @dataclass
@@ -260,6 +272,15 @@ class TiledMultiCameraRenderer:
     def _prepare_traffic_light_assets(self) -> Tuple[List[np.ndarray], Optional[Dict[str, Dict[str, List[str]]]]]:
         """Precompute traffic light geometry and status sequences."""
 
+        # Per-head geometry for the per-camera facing cull (see
+        # _project_traffic_lights): head center and lit-lens view-normal in the RDF
+        # world frame (local +x is the lens normal), plus whether the head's
+        # orientation is known -- an unknown orientation has no meaningful normal, so
+        # such heads are never culled.
+        self._tl_centers: List[np.ndarray] = []
+        self._tl_normals: List[np.ndarray] = []
+        self._tl_orientation_known: List[bool] = []
+
         if not self.scene_data.traffic_lights:
             return [], None
 
@@ -276,6 +297,10 @@ class TiledMultiCameraRenderer:
             cuboid_vertices = build_cuboid_bounding_box(dims[0], dims[1], dims[2], transform)
             polyline = cuboid3d_to_polyline(cuboid_vertices).astype(np.float32)
             polylines.append(polyline)
+
+            self._tl_centers.append(np.asarray(transform[:3, 3], dtype=np.float64))
+            self._tl_normals.append(np.asarray(transform[:3, :3], dtype=np.float64) @ np.array([1.0, 0.0, 0.0]))
+            self._tl_orientation_known.append(bool(light.metadata.get("orientation_known", True)))
 
             status_dict[str(idx)] = {"state": sequence}
 
@@ -316,6 +341,17 @@ class TiledMultiCameraRenderer:
         if not self.traffic_light_polylines:
             return []
 
+        # Per-camera facing cull: drop heads whose lit lens points away from this
+        # camera (it would image only their dark housing back); keep heads whose
+        # orientation is unknown. None means the cull is disabled.
+        facing_ok = compute_traffic_light_facing_mask(
+            self._tl_centers,
+            self._tl_normals,
+            self._tl_orientation_known,
+            np.asarray(camera_pose, dtype=np.float64)[:3, 3],
+            TRAFFIC_LIGHT_FACING_CULL_DEG,
+        )
+
         return create_traffic_light_status_geometry_objects_from_data(
             self.traffic_light_polylines,
             self.traffic_light_status_dict,
@@ -323,6 +359,7 @@ class TiledMultiCameraRenderer:
             camera_pose,
             camera_model,
             self.traffic_light_colors,
+            facing_ok,
         )
 
     def _init_persistent_vbos(self) -> None:
