@@ -52,6 +52,7 @@ from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.pcd_utils i
     triangulate_polygon_3d,
 )
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.traffic_light_utils import (
+    compute_traffic_light_facing_mask,
     create_traffic_light_status_geometry_objects_from_data,
     load_traffic_light_colors,
 )
@@ -273,9 +274,12 @@ class TiledMultiCameraRenderer:
 
         # Per-head geometry for the per-camera facing cull (see
         # _project_traffic_lights): head center and lit-lens view-normal in the RDF
-        # world frame. Local +x is the lens normal.
+        # world frame (local +x is the lens normal), plus whether the head's
+        # orientation is known -- an unknown orientation has no meaningful normal, so
+        # such heads are never culled.
         self._tl_centers: List[np.ndarray] = []
         self._tl_normals: List[np.ndarray] = []
+        self._tl_orientation_known: List[bool] = []
 
         if not self.scene_data.traffic_lights:
             return [], None
@@ -296,6 +300,7 @@ class TiledMultiCameraRenderer:
 
             self._tl_centers.append(np.asarray(transform[:3, 3], dtype=np.float64))
             self._tl_normals.append(np.asarray(transform[:3, :3], dtype=np.float64) @ np.array([1.0, 0.0, 0.0]))
+            self._tl_orientation_known.append(bool(light.metadata.get("orientation_known", True)))
 
             status_dict[str(idx)] = {"state": sequence}
 
@@ -336,19 +341,16 @@ class TiledMultiCameraRenderer:
         if not self.traffic_light_polylines:
             return []
 
-        # Per-camera facing cull: keep a head only if its lit lens faces this camera
-        # (the camera lies within TRAFFIC_LIGHT_FACING_CULL_DEG of the lens normal).
-        # facing_ok[i] is False for heads whose dark back this camera would image.
-        facing_ok: Optional[List[bool]] = None
-        if TRAFFIC_LIGHT_FACING_CULL_DEG > 0 and self._tl_normals:
-            camera_position = np.asarray(camera_pose, dtype=np.float64)[:3, 3]
-            cos_cutoff = math.cos(math.radians(TRAFFIC_LIGHT_FACING_CULL_DEG))
-            facing_ok = []
-            for center, normal in zip(self._tl_centers, self._tl_normals):
-                view = camera_position - center
-                denom = np.linalg.norm(view) * np.linalg.norm(normal)
-                cos_angle = float(np.dot(normal, view) / denom) if denom > 0 else 1.0
-                facing_ok.append(cos_angle >= cos_cutoff)
+        # Per-camera facing cull: drop heads whose lit lens points away from this
+        # camera (it would image only their dark housing back); keep heads whose
+        # orientation is unknown. None means the cull is disabled.
+        facing_ok = compute_traffic_light_facing_mask(
+            self._tl_centers,
+            self._tl_normals,
+            self._tl_orientation_known,
+            np.asarray(camera_pose, dtype=np.float64)[:3, 3],
+            TRAFFIC_LIGHT_FACING_CULL_DEG,
+        )
 
         return create_traffic_light_status_geometry_objects_from_data(
             self.traffic_light_polylines,
