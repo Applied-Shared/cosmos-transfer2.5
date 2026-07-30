@@ -60,6 +60,17 @@ if TYPE_CHECKING:
     from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.data_types import SceneData, TrafficLight
 
 
+# A traffic-light lens only shows its color to a camera roughly in front of it; a head
+# facing away shows its dark housing back. In a multi-camera render, a head that faces
+# one camera (e.g. front) is often back-facing another (e.g. rear), so drawing its lit
+# color into every camera paints a signal on a back the camera actually images. Per
+# camera, cull a head when the angle between its lit-lens normal and the head->camera
+# direction exceeds this cutoff. The facing distribution is bimodal -- genuine facers
+# well under, back-facers well over -- so 90 degrees sits in the gap with margin. Set
+# <= 0 to disable the cull.
+TRAFFIC_LIGHT_FACING_CULL_DEG = 90.0
+
+
 @dataclass
 class StaticMapCache:
     """Cached static map data after preprocessing."""
@@ -260,6 +271,12 @@ class TiledMultiCameraRenderer:
     def _prepare_traffic_light_assets(self) -> Tuple[List[np.ndarray], Optional[Dict[str, Dict[str, List[str]]]]]:
         """Precompute traffic light geometry and status sequences."""
 
+        # Per-head geometry for the per-camera facing cull (see
+        # _project_traffic_lights): head center and lit-lens view-normal in the RDF
+        # world frame. Local +x is the lens normal.
+        self._tl_centers: List[np.ndarray] = []
+        self._tl_normals: List[np.ndarray] = []
+
         if not self.scene_data.traffic_lights:
             return [], None
 
@@ -276,6 +293,9 @@ class TiledMultiCameraRenderer:
             cuboid_vertices = build_cuboid_bounding_box(dims[0], dims[1], dims[2], transform)
             polyline = cuboid3d_to_polyline(cuboid_vertices).astype(np.float32)
             polylines.append(polyline)
+
+            self._tl_centers.append(np.asarray(transform[:3, 3], dtype=np.float64))
+            self._tl_normals.append(np.asarray(transform[:3, :3], dtype=np.float64) @ np.array([1.0, 0.0, 0.0]))
 
             status_dict[str(idx)] = {"state": sequence}
 
@@ -316,6 +336,20 @@ class TiledMultiCameraRenderer:
         if not self.traffic_light_polylines:
             return []
 
+        # Per-camera facing cull: keep a head only if its lit lens faces this camera
+        # (the camera lies within TRAFFIC_LIGHT_FACING_CULL_DEG of the lens normal).
+        # facing_ok[i] is False for heads whose dark back this camera would image.
+        facing_ok: Optional[List[bool]] = None
+        if TRAFFIC_LIGHT_FACING_CULL_DEG > 0 and self._tl_normals:
+            camera_position = np.asarray(camera_pose, dtype=np.float64)[:3, 3]
+            cos_cutoff = math.cos(math.radians(TRAFFIC_LIGHT_FACING_CULL_DEG))
+            facing_ok = []
+            for center, normal in zip(self._tl_centers, self._tl_normals):
+                view = camera_position - center
+                denom = np.linalg.norm(view) * np.linalg.norm(normal)
+                cos_angle = float(np.dot(normal, view) / denom) if denom > 0 else 1.0
+                facing_ok.append(cos_angle >= cos_cutoff)
+
         return create_traffic_light_status_geometry_objects_from_data(
             self.traffic_light_polylines,
             self.traffic_light_status_dict,
@@ -323,6 +357,7 @@ class TiledMultiCameraRenderer:
             camera_pose,
             camera_model,
             self.traffic_light_colors,
+            facing_ok,
         )
 
     def _init_persistent_vbos(self) -> None:

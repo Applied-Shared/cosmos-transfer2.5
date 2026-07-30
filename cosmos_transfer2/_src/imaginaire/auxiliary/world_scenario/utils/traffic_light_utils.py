@@ -83,6 +83,7 @@ def create_traffic_light_status_geometry_objects_from_data(
     camera_pose: np.ndarray,
     camera_model: Any,  # Camera model instance (FThetaCamera or similar)
     tl_status_to_rgb: Dict,
+    facing_ok: Optional[List[bool]] = None,
 ) -> List[Polygon2D]:
     """
     Build geometry objects (Polygon2D) for traffic lights for a single frame.
@@ -97,6 +98,9 @@ def create_traffic_light_status_geometry_objects_from_data(
         camera_pose: Camera pose matrix (4x4)
         camera_model: Camera model
         tl_status_to_rgb: Mapping from status to RGB values
+        facing_ok: Optional per-head mask; when provided, heads whose entry is False
+            are skipped for this camera (their lit lens faces away from it). None
+            keeps every head (no facing cull).
 
     Returns:
         List of Polygon2D objects for traffic lights
@@ -108,6 +112,10 @@ def create_traffic_light_status_geometry_objects_from_data(
     polygon_colors = []
 
     for traffic_light_index, tl_polyline in enumerate(traffic_light_position_list):
+        # Per-camera facing cull: skip heads whose lit lens points away from this
+        # camera (it would image only their dark housing back).
+        if facing_ok is not None and traffic_light_index < len(facing_ok) and not facing_ok[traffic_light_index]:
+            continue
         if traffic_light_per_frame_status_dict is None:
             # Use unknown color for traffic light without status
             # This is exactly what cosmos-av-sample-toolkits does
