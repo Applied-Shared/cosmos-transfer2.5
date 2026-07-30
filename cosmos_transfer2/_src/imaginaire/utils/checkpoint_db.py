@@ -76,7 +76,13 @@ from typing_extensions import Self, override
 from cosmos_transfer2._src.imaginaire.flags import EXPERIMENTAL_CHECKPOINTS, INTERNAL
 from cosmos_transfer2._src.imaginaire.utils import log
 
-_MINIMUM_HF_CLI_VERSION = "1.3.5"
+# Pin the HF CLI to an exact known-good release rather than an open-ended range.
+# uvx resolves an unbounded "hf>=X" to the newest match on PyPI at runtime, so a new
+# release can silently change behavior mid-run. hf 1.26.0 changed offline resolution to
+# call the Hub tree API even for locally cached snapshots, which breaks HF_HUB_OFFLINE=1
+# downloads of revisions staged/aliased in the WFM cache. 1.25.1 is the last release that
+# resolves those cached snapshots offline without contacting the Hub.
+_HF_CLI_VERSION = "1.25.1"
 
 
 def _is_uuid(checkpoint_uri: str) -> bool:
@@ -158,7 +164,7 @@ def _hf_download(cmd_args: list[str]) -> str:
     """
     cmd = [
         "uvx",
-        f"hf>={_MINIMUM_HF_CLI_VERSION}",
+        f"hf=={_HF_CLI_VERSION}",
         "download",
         *cmd_args,
     ]
