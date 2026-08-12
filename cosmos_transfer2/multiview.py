@@ -469,6 +469,8 @@ class MultiviewInference:
                         color_message(f"Generated videos saved to:\n" + "\n".join(output_messages) + "\n", "green")
                     )
 
-        if sample.save_combined_views:
-            return str(output_dir / "combined.mp4")
-        return output_messages[0] if output_messages else f"{output_path}.mp4"
+                if sample.save_combined_views:
+                    return str(output_dir / "combined.mp4")
+                return output_messages[0] if output_messages else f"{output_path}.mp4"
+
+        return f"{output_path}.mp4"
