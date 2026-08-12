@@ -115,6 +115,9 @@ class MultiviewInferenceArguments(CommonInferenceArguments):
     save_combined_views: bool = True
     """Save a single concatenated video containing all views side-by-side. If False, saves individual split views and a grid view."""
 
+    restore_original_resolution: bool = True
+    """Resize each per-view output back to the original input video resolution. Uses the original_hw metadata captured during frame extraction."""
+
     @pydantic.model_validator(mode="after")
     def validate_input_paths(self):
         """Validate that input_path is provided when num_conditional_frames > 0."""

@@ -102,6 +102,23 @@ def setup_config(
     return AugmentationConfig(**kwargs)
 
 
+def _resize_view_to_original(view_tensor: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+    """Resize a per-view video tensor from model resolution back to original input resolution.
+
+    BILINEAR matches the interpolation used by the dataset loader's initial
+    stretch to (720, 1280), so this reverses that transformation.
+    """
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    # Ensure even dimensions for ffmpeg compatibility.
+    target_h -= target_h % 2
+    target_w -= target_w % 2
+    if (target_h, target_w) == view_tensor.shape[-2:]:
+        return view_tensor
+    from torchvision.transforms import InterpolationMode, Resize
+
+    return Resize((target_h, target_w), interpolation=InterpolationMode.BILINEAR, antialias=True)(view_tensor)
+
+
 class MultiviewInference:
     def __init__(self, args: MultiviewSetupArguments):
         log.debug(f"{args.__class__.__name__}({args})")
@@ -290,6 +307,10 @@ class MultiviewInference:
 
         for _, batch in enumerate(dataloader):
             batch["control_weight"] = sample.control_weight
+            # Per-camera (H, W) of the input video files, captured during frame
+            # extraction. Shape: (1, num_cameras, 2). Used to restore each view's
+            # output to its original resolution after model generation at 720p.
+            original_hw = batch.get("original_hw")
             if sample.enable_autoregressive:
                 num_conditional_frames_per_view = [
                     getattr(sample, k).num_conditional_frames_per_view for k in augmentation_config.camera_keys
@@ -326,10 +347,8 @@ class MultiviewInference:
                         for pixel_frames in num_conditional_frames
                     ]
                 else:
-                    num_conditional_latent_frames = (
-                        self.pipe.model.tokenizer.get_latent_num_frames(  # pyrefly: ignore # missing-attribute
-                            num_conditional_frames
-                        )
+                    num_conditional_latent_frames = self.pipe.model.tokenizer.get_latent_num_frames(  # pyrefly: ignore # missing-attribute
+                        num_conditional_frames
                     )
                 batch["num_conditional_frames"] = num_conditional_latent_frames
                 video = self.pipe.generate_from_batch(
@@ -374,7 +393,6 @@ class MultiviewInference:
 
                 if sample.save_combined_views:
                     save_combined_video()
-                    return str(output_dir / "combined.mp4")
 
                 total_frames = video.shape[1]
                 n_views = len(augmentation_config.camera_keys)
@@ -400,43 +418,50 @@ class MultiviewInference:
                     view_name = camera_keys[view_index] if view_index < len(camera_keys) else f"view_{view_index}"
                     view_tensors.append((view_name, view_tensor))
 
-                # Save individual view videos
+                # Save individual view videos, optionally resized back to the
+                # original input resolution for each camera.
                 output_messages = []
-                for view_name, view_tensor in view_tensors:
+                for view_index, (view_name, view_tensor) in enumerate(view_tensors):
+                    if sample.restore_original_resolution and original_hw is not None:
+                        view_hw = original_hw[0, view_index]
+                        view_tensor = _resize_view_to_original(view_tensor, (int(view_hw[0]), int(view_hw[1])))
                     view_output_path = str(output_dir / view_name)
                     save_img_or_video(view_tensor, view_output_path, fps=sample.fps, quality=8)
                     output_messages.append(f"{view_output_path}.mp4")
 
-                # Save grid video using a spatial layout that mirrors the car's
-                # forward/backward and left/right axes. Cells without an active
-                # view stay black (zero-initialized).
-                grid_rows = len(SPATIAL_GRID_LAYOUT)
-                grid_cols = max(len(row) for row in SPATIAL_GRID_LAYOUT)
-                c, t, h, w = view_tensors[0][1].shape
-                grid_tensor = torch.zeros((c, t, grid_rows * h, grid_cols * w), dtype=video.dtype, device=video.device)
+                if not sample.save_combined_views:
+                    # Save grid video using a spatial layout that mirrors the car's
+                    # forward/backward and left/right axes. Cells without an active
+                    # view stay black (zero-initialized).
+                    grid_rows = len(SPATIAL_GRID_LAYOUT)
+                    grid_cols = max(len(row) for row in SPATIAL_GRID_LAYOUT)
+                    c, t, h, w = view_tensors[0][1].shape
+                    grid_tensor = torch.zeros(
+                        (c, t, grid_rows * h, grid_cols * w), dtype=video.dtype, device=video.device
+                    )
 
-                view_tensor_by_name = {view_name: view_tensor for view_name, view_tensor in view_tensors}
-                num_views_in_grid = 0
-                for row_idx, layout_row in enumerate(SPATIAL_GRID_LAYOUT):
-                    for col_idx, view_name in enumerate(layout_row):
-                        if view_name is None:
-                            continue
-                        view_tensor = view_tensor_by_name.get(view_name)
-                        if view_tensor is None:
-                            continue
-                        grid_tensor[
-                            :,
-                            :,
-                            row_idx * h : (row_idx + 1) * h,
-                            col_idx * w : (col_idx + 1) * w,
-                        ] = view_tensor
-                        num_views_in_grid += 1
+                    view_tensor_by_name = {view_name: view_tensor for view_name, view_tensor in view_tensors}
+                    num_views_in_grid = 0
+                    for row_idx, layout_row in enumerate(SPATIAL_GRID_LAYOUT):
+                        for col_idx, view_name in enumerate(layout_row):
+                            if view_name is None:
+                                continue
+                            view_tensor = view_tensor_by_name.get(view_name)
+                            if view_tensor is None:
+                                continue
+                            grid_tensor[
+                                :,
+                                :,
+                                row_idx * h : (row_idx + 1) * h,
+                                col_idx * w : (col_idx + 1) * w,
+                            ] = view_tensor
+                            num_views_in_grid += 1
 
-                grid_output_path = str(output_dir / "grid")
-                save_img_or_video(grid_tensor, grid_output_path, fps=sample.fps, quality=8)
-                output_messages.append(
-                    f"{grid_output_path}.mp4 ({num_views_in_grid} views in {grid_rows}x{grid_cols} grid)"
-                )
+                    grid_output_path = str(output_dir / "grid")
+                    save_img_or_video(grid_tensor, grid_output_path, fps=sample.fps, quality=8)
+                    output_messages.append(
+                        f"{grid_output_path}.mp4 ({num_views_in_grid} views in {grid_rows}x{grid_cols} grid)"
+                    )
 
                 # Log all outputs at once
                 if output_messages:
