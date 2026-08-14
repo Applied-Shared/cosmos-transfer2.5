@@ -40,6 +40,30 @@ def load_bbox_colors(version: str = "v3") -> Dict:
     return bbox_config[version]
 
 
+def simplify_object_type(object_type: str) -> str:
+    """Map an object type string to one of the standard bbox color categories.
+
+    Uses exactly 5 object categories: Car, Truck, Pedestrian, Cyclist, Others.
+
+    Each bucket lists its own canonical name first so that already-canonical
+    types map to themselves and the function is idempotent.
+
+    Should be consistent with the inline type simplification in
+    cosmos-av-sample-toolkits/utils/bbox_utils.py:create_bbox_projection.
+    """
+    obj_type_normalized = object_type.replace("_", " ").replace("-", " ").title().replace(" ", "_")
+    if obj_type_normalized in ["Truck", "Bus", "Heavy_Truck", "Train_Or_Tram_Car", "Trolley_Bus", "Trailer"]:
+        return "Truck"
+    elif obj_type_normalized in ["Car", "Vehicle", "Automobile", "Other_Vehicle"]:
+        return "Car"
+    elif obj_type_normalized in ["Pedestrian", "Person"]:
+        return "Pedestrian"
+    elif obj_type_normalized in ["Cyclist", "Rider", "Motorcycle", "Bicycle"]:
+        return "Cyclist"
+    else:
+        return "Others"
+
+
 def interpolate_pose(prev_pose: np.ndarray, next_pose: np.ndarray, t: float) -> np.ndarray:
     """
     new pose = (1 - t) * prev_pose + t * next_pose.
