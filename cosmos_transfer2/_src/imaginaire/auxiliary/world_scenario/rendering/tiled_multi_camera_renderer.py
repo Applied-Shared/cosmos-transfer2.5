@@ -29,6 +29,7 @@ from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders.data_
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.bbox_utils import (
     build_cuboid_bounding_box,
     load_bbox_colors,
+    simplify_object_type,
 )
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.camera.ftheta import FThetaCamera
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.graphics_utils import (
@@ -1418,25 +1419,8 @@ class TiledMultiCameraRenderer:
         return np.flipud(image)
 
     def _simplify_object_type(self, object_type: str) -> str:
-        """Map object type to standard categories for v3 color scheme.
-
-        Uses exactly 5 object categories: Car, Truck, Pedestrian, Cyclist, Others.
-
-        Should be consistent with cosmos-av-sample-toolkits/utils/bbox_utils.py:simplify_type_in_object_info
-        """
-        obj_type_normalized = object_type.replace("_", " ").replace("-", " ").title().replace(" ", "_")
-        if obj_type_normalized in ["Bus", "Heavy_Truck", "Train_Or_Tram_Car", "Trolley_Bus", "Trailer"]:
-            return "Truck"
-        elif obj_type_normalized in ["Vehicle", "Automobile", "Other_Vehicle", "Car"]:
-            return "Car"
-        elif obj_type_normalized in ["Person", "Pedestrian"]:
-            return "Pedestrian"
-        elif obj_type_normalized in ["Rider", "Cyclist", "Motorcycle", "Bicycle"]:
-            return "Cyclist"
-        elif obj_type_normalized in ["Other", "Others"]:  # Explicitly handle both singular and plural
-            return "Others"
-        else:
-            return "Others"
+        """Map object type to standard categories for v3 color scheme."""
+        return simplify_object_type(object_type)
 
     def _report_performance(self) -> None:
         """Report rendering performance metrics."""
