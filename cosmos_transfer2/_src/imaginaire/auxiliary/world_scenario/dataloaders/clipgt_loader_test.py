@@ -191,8 +191,11 @@ def test_should_emit_separate_lights_per_label_class_id(monkeypatch):
     assert len(scene.traffic_lights) == 2
 
 
-def test_should_hold_first_state_for_frames_before_first_observation(monkeypatch):
+def test_should_mark_frames_before_first_observation_as_unknown(monkeypatch):
     # Precondition. First observation is at t=15, after frames at 0 and 10.
+    # A signal not yet observed must render gray (UNKNOWN), not borrow the
+    # color of a later frame: otherwise a light that turns green partway through
+    # the clip would appear green from frame 0.
     scene = _scene_with_frame_timestamps([0, 10, 20])
     rows = [
         {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "GREEN"}, "key": _key("7", 15)},
@@ -202,8 +205,30 @@ def test_should_hold_first_state_for_frames_before_first_observation(monkeypatch
     # Under test.
     _load_keyed(monkeypatch, scene, rows)
 
-    # Postcondition. Leading frames clamp to the earliest observation.
-    assert scene.traffic_lights[0].metadata["state_sequence"] == ["GREEN", "GREEN", "RED"]
+    # Postcondition. Leading frames stay UNKNOWN; hold-last applies once the
+    # signal is first observed.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["unknown", "unknown", "RED"]
+
+
+def test_should_not_broadcast_late_green_backward_to_early_frames(monkeypatch):
+    # Precondition mirroring the reported regression: a RED light observed from
+    # t=0, and a separate GREEN light that only enters the view at t=15.
+    scene = _scene_with_frame_timestamps([0, 5, 10, 15, 20])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("red", 0)},
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "RED"}, "key": _key("red", 20)},
+        {"traffic_light": {"center": _CENTER, "orientation": _IDENTITY, "state": "GREEN"}, "key": _key("green", 15)},
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. The green light is UNKNOWN (gray) until t=15, so the early
+    # frames show only the red light — no red+green overlay.
+    red = next(tl for tl in scene.traffic_lights if tl.element_id == "traffic_light_red")
+    green = next(tl for tl in scene.traffic_lights if tl.element_id == "traffic_light_green")
+    assert red.metadata["state_sequence"] == ["RED", "RED", "RED", "RED", "RED"]
+    assert green.metadata["state_sequence"] == ["unknown", "unknown", "unknown", "GREEN", "GREEN"]
 
 
 def test_should_broadcast_when_label_present_but_timestamp_null(monkeypatch):

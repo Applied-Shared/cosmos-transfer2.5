@@ -1026,10 +1026,12 @@ class ClipGTLoader(SceneDataLoader):
         ``observations`` are ``(timestamp_micros, light)`` tuples for one signal.
         Observations carrying a usable state and a timestamp are sorted and mapped
         onto ``frame_timestamps`` by holding the most recent state at or before
-        each frame (leading frames clamp to the first observation). When no
-        observation carries a timestamp, the single representative state is
-        broadcast across all frames. Returns ``None`` when the signal has no
-        usable (non-empty string) state, leaving the light UNKNOWN (gray).
+        each frame. Frames before the first observation are left UNKNOWN (gray):
+        a signal that only enters the sensor view mid-clip must not be colored as
+        if its first observed state were already active. When no observation
+        carries a timestamp, the single representative state is broadcast across
+        all frames. Returns ``None`` when the signal has no usable (non-empty
+        string) state, leaving the light UNKNOWN (gray).
         """
         timed: List[Tuple[int, str]] = []
         untimed_state: Optional[str] = None
@@ -1049,11 +1051,16 @@ class ClipGTLoader(SceneDataLoader):
             if frame_timestamps is None or len(frame_timestamps) == 0:
                 # No frame grid to align to: hold the earliest observed state.
                 return [observed_states[0]] * num_frames
-            # Most recent observation at or before each frame; clamp leading
-            # frames (before the first observation) to the first state.
+            # Most recent observation at or before each frame. searchsorted gives
+            # -1 for frames before the first observation; those frames never saw
+            # the signal, so they stay UNKNOWN rather than borrowing the first
+            # observed color (which would render a late-green light as green from
+            # frame 0).
             indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
-            indices = np.clip(indices, 0, len(observed_states) - 1)
-            return [observed_states[int(i)] for i in indices]
+            return [
+                observed_states[int(i)] if i >= 0 else "unknown"
+                for i in indices
+            ]
 
         if untimed_state is not None:
             return [untimed_state] * num_frames
