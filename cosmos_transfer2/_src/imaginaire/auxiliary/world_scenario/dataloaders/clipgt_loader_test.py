@@ -219,3 +219,72 @@ def test_should_broadcast_when_label_present_but_timestamp_null(monkeypatch):
     # Postcondition. Single representative state broadcast across all frames.
     assert len(scene.traffic_lights) == 1
     assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 3
+
+
+def _light_row(label_id, timestamp, state, center=None):
+    light = {"center": center or _CENTER, "orientation": _IDENTITY, "state": state}
+    return {"traffic_light": light, "key": _key(label_id, timestamp)}
+
+
+def test_should_keep_lead_in_guess_when_gap_is_short(monkeypatch):
+    # Precondition. First observation 1.5s in -- well under the backfill window.
+    scene = _scene_with_frame_timestamps([0, 1_000_000, 2_000_000])
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, [_light_row("7", 1_500_000, "GREEN")])
+
+    # Postcondition. The short lead-in carries the first observed color.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["GREEN"] * 3
+
+
+def test_should_mark_lead_in_unknown_when_gap_exceeds_backfill_window(monkeypatch):
+    # Precondition. First observation 9s in; no other signal nearby.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, [_light_row("7", 9_000_000, "RED")])
+
+    # Postcondition. Only the 3s window before the observation keeps the guess.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == [None] * 6 + ["RED"] * 4
+
+
+def test_should_keep_full_lead_in_when_colocated_signal_corroborates(monkeypatch):
+    # Precondition. A co-located signal (0.5m away) observed the same color from t=0.
+    scene = _scene_with_frame_timestamps([i * 2_000_000 for i in range(11)])
+    near = {"x": 1.0, "y": 2.5, "z": 3.0}
+    rows = [_light_row("7", 0, "RED"), _light_row("8", 20_000_000, "RED", center=near)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Corroborated: the 20s lead-in keeps the guess end to end.
+    late = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_8")
+    assert late.metadata["state_sequence"] == ["RED"] * 11
+
+
+def test_should_mark_lead_in_unknown_when_colocated_signal_contradicts(monkeypatch):
+    # Precondition. A co-located signal observed a DIFFERENT color during the gap.
+    scene = _scene_with_frame_timestamps([i * 2_000_000 for i in range(11)])
+    near = {"x": 1.0, "y": 2.5, "z": 3.0}
+    rows = [_light_row("7", 0, "RED"), _light_row("8", 20_000_000, "GREEN", center=near)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. The contradicted guess is dropped; only the observation stays.
+    late = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_8")
+    assert late.metadata["state_sequence"] == [None] * 10 + ["GREEN"]
+
+
+def test_should_not_use_far_signal_as_lead_in_evidence(monkeypatch):
+    # Precondition. A conflicting signal exists but 100m away -- a different head.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    far = {"x": 101.0, "y": 2.0, "z": 3.0}
+    rows = [_light_row("7", 0, "RED"), _light_row("8", 9_000_000, "GREEN", center=far)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. No contradiction applied; the plain backfill window governs.
+    late = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_8")
+    assert late.metadata["state_sequence"] == [None] * 6 + ["GREEN"] * 4

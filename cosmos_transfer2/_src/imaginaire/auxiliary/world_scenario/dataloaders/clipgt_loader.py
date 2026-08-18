@@ -53,6 +53,79 @@ from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders.data_
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.camera.ftheta import FThetaCamera
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.laneline_utils import build_lane_line_type
 
+# An unwitnessed color is only assumed constant across a short lead-in window:
+# real signal phases rarely last less than ~3 s (a yellow phase), so extrapolating
+# further back than that without evidence is a coin flip.
+_TL_BACKFILL_MAX_LEAD_MICROS = 3_000_000
+# Signals closer than this are treated as observing the same physical head (or
+# the same mast): duplicate track fragments of one head sit well within a couple
+# of meters of each other, while heads for different approaches sit farther apart.
+_TL_COLOCATED_DISTANCE_M = 2.5
+
+
+class _TrafficLightSequence:
+    """Per-signal state sequence plus what's needed to vet its lead-in guess."""
+
+    def __init__(self, center: np.ndarray, states: List[Optional[str]], first_observed_frame: int) -> None:
+        self.center = center
+        self.states = states
+        self.first_observed_frame = first_observed_frame
+
+
+def _resolve_traffic_light_lead_ins(
+    lights: List[_TrafficLightSequence], frame_timestamps: Optional[np.ndarray]
+) -> None:
+    """Decide how much of each signal's leading-frame color guess to keep.
+
+    Frames before a signal's first observation carry its first observed color as
+    a guess, not data. A guess is only trustworthy as far back as evidence
+    supports it, so for each signal with a lead-in gap this weighs the states
+    that co-located signals (within ``_TL_COLOCATED_DISTANCE_M`` -- duplicate
+    track fragments or heads on the same mast) actually observed during the gap:
+
+    - Any co-located signal showing a DIFFERENT color during the gap means the
+      guess is wrong for part of the gap, and rendering it would draw two
+      contradictory boxes on one physical head. The whole lead-in becomes
+      UNKNOWN (``None`` entries, rendered gray).
+    - A co-located signal showing the SAME color pushes the witnessed boundary
+      back to that evidence, keeping the guess through the corroborated span.
+    - With no evidence either way, the guess is kept only for
+      ``_TL_BACKFILL_MAX_LEAD_MICROS`` before the earliest witness; earlier
+      frames become UNKNOWN.
+
+    Only frames at or after a signal's own first observation count as evidence:
+    a lead-in guess can't corroborate or contradict another guess. Mutates each
+    ``states`` list in place.
+    """
+    if frame_timestamps is None or len(frame_timestamps) == 0:
+        return
+    for light in lights:
+        gap_frames = min(light.first_observed_frame, len(light.states))
+        if gap_frames <= 0:
+            continue
+        guess = light.states[0]
+        contradicted = False
+        witnessed_frame = gap_frames  # frame index of the earliest supporting evidence
+        for other in lights:
+            if other is light:
+                continue
+            if float(np.linalg.norm(light.center - other.center)) > _TL_COLOCATED_DISTANCE_M:
+                continue
+            for frame in range(other.first_observed_frame, gap_frames):
+                if other.states[frame] != guess:
+                    contradicted = True
+                    break
+                witnessed_frame = min(witnessed_frame, frame)
+            if contradicted:
+                break
+        if contradicted:
+            light.states[:gap_frames] = [None] * gap_frames
+            continue
+        witnessed_ts = int(frame_timestamps[min(witnessed_frame, len(frame_timestamps) - 1)])
+        for frame in range(gap_frames):
+            if int(frame_timestamps[frame]) < witnessed_ts - _TL_BACKFILL_MAX_LEAD_MICROS:
+                light.states[frame] = None
+
 
 @auto_register(priority=10)  # High priority for ClipGT format
 class ClipGTLoader(SceneDataLoader):
@@ -940,6 +1013,9 @@ class ClipGTLoader(SceneDataLoader):
         signal that changes color mid-clip becomes a single light whose
         ``metadata["state_sequence"]`` steps through its colors, aligned onto the
         ego/render frame grid by holding the last observed state between updates.
+        Frames before a signal's first observation carry its first observed color
+        only as far back as corroborating evidence supports (see
+        ``_resolve_traffic_light_lead_ins``); beyond that they stay UNKNOWN.
         A signal with no usable state stays UNKNOWN (gray). Orientation is
         optional: a missing or null quaternion falls back to identity instead of
         raising.
@@ -948,6 +1024,7 @@ class ClipGTLoader(SceneDataLoader):
 
         num_frames = max(1, scene_data.num_frames)
         frame_timestamps = scene_data.timestamps  # microseconds, one per frame
+        pending: List[_TrafficLightSequence] = []
 
         # Group rows by the stable per-signal id so multiple per-timestamp rows
         # collapse into one light. Fall back to the row index when the key is
@@ -1007,28 +1084,39 @@ class ClipGTLoader(SceneDataLoader):
             # Build the per-frame color sequence. Timestamped observations step
             # through colors aligned to the frame grid (hold-last); a single
             # untimed row broadcasts its state. An absent state stays gray.
-            state_sequence = self._build_traffic_light_state_sequence(
-                observations, frame_timestamps, num_frames
-            )
-            if state_sequence is not None:
-                traffic_light.metadata["state_sequence"] = state_sequence
+            built = self._build_traffic_light_state_sequence(observations, frame_timestamps, num_frames)
+            if built is not None:
+                states, first_observed_frame = built
+                pending.append(
+                    _TrafficLightSequence(
+                        center=center,
+                        states=states,
+                        first_observed_frame=first_observed_frame,
+                    )
+                )
+                traffic_light.metadata["state_sequence"] = states
 
             scene_data.traffic_lights.append(traffic_light)
+
+        _resolve_traffic_light_lead_ins(pending, frame_timestamps)
 
     @staticmethod
     def _build_traffic_light_state_sequence(
         observations: List[Tuple[Optional[int], Dict[str, Any]]],
         frame_timestamps: np.ndarray,
         num_frames: int,
-    ) -> Optional[List[str]]:
+    ) -> Optional[Tuple[List[Optional[str]], int]]:
         """Build a length-``num_frames`` list of traffic-light state strings.
 
         ``observations`` are ``(timestamp_micros, light)`` tuples for one signal.
         Observations carrying a usable state and a timestamp are sorted and mapped
         onto ``frame_timestamps`` by holding the most recent state at or before
-        each frame (leading frames clamp to the first observation). When no
-        observation carries a timestamp, the single representative state is
-        broadcast across all frames. Returns ``None`` when the signal has no
+        each frame; leading frames provisionally carry the first observed state
+        (``_resolve_traffic_light_lead_ins`` decides how much of that guess to
+        keep). When no observation carries a timestamp, the single representative
+        state is broadcast across all frames. Returns ``(states,
+        first_observed_frame)`` where frames before ``first_observed_frame`` are
+        guesses rather than observations, or ``None`` when the signal has no
         usable (non-empty string) state, leaving the light UNKNOWN (gray).
         """
         timed: List[Tuple[int, str]] = []
@@ -1048,15 +1136,16 @@ class ClipGTLoader(SceneDataLoader):
             observed_states = [state for _, state in timed]
             if frame_timestamps is None or len(frame_timestamps) == 0:
                 # No frame grid to align to: hold the earliest observed state.
-                return [observed_states[0]] * num_frames
-            # Most recent observation at or before each frame; clamp leading
-            # frames (before the first observation) to the first state.
+                return [observed_states[0]] * num_frames, 0
+            # Most recent observation at or before each frame; frames before the
+            # first observation provisionally take the first state.
             indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
             indices = np.clip(indices, 0, len(observed_states) - 1)
-            return [observed_states[int(i)] for i in indices]
+            first_observed_frame = int(np.searchsorted(frame_timestamps, observed_ts[0], side="left"))
+            return [observed_states[int(i)] for i in indices], first_observed_frame
 
         if untimed_state is not None:
-            return [untimed_state] * num_frames
+            return [untimed_state] * num_frames, 0
 
         return None
 
