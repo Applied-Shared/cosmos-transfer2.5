@@ -16,7 +16,7 @@ unified SceneData representation.
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -254,9 +254,15 @@ def _apply_traffic_light_merge_seam(
 class _TrafficLightSequence:
     """Per-signal state sequence plus what's needed to vet its unwitnessed guesses.
 
-    ``states[first_observed_frame:last_observed_end]`` is the witnessed span
-    (real observations plus hold-last interpolation between them); frames outside
-    it carry guesses whose keep-or-drop decision the resolvers below make.
+    ``states[first_observed_frame:last_observed_end]`` spans first to last
+    observation. For a single track the whole span is witnessed (real
+    observations plus hold-last interpolation between them); for a merged light
+    only ``witnessed_intervals`` -- each member fragment's own span -- is, and
+    the seam frames between fragments carry midpoint-rule guesses (see
+    ``_apply_traffic_light_merge_seam``). Frames outside the span carry lead-in
+    / trailing guesses. The resolvers below decide whether each guess is kept;
+    guesses never count as evidence for other lights, so evidence scans must go
+    through ``witnessed_frames`` rather than the raw span.
     """
 
     def __init__(
@@ -266,12 +272,19 @@ class _TrafficLightSequence:
         first_observed_frame: int,
         last_observed_end: int,
         last_observed_ts: Optional[int],
+        witnessed_intervals: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         self.center = center
         self.states = states
         self.first_observed_frame = first_observed_frame
         self.last_observed_end = last_observed_end
         self.last_observed_ts = last_observed_ts
+        self.witnessed_intervals = witnessed_intervals or [(first_observed_frame, last_observed_end)]
+
+    def witnessed_frames(self, lo: int, hi: int) -> Iterator[int]:
+        """Genuinely witnessed frame indices within ``[lo, hi)``, ascending."""
+        for start, end in self.witnessed_intervals:
+            yield from range(max(start, lo), min(end, hi))
 
 
 def _resolve_traffic_light_lead_ins(
@@ -295,9 +308,9 @@ def _resolve_traffic_light_lead_ins(
       ``_TL_STATE_HOLD_MAX_MICROS`` before the earliest witness; earlier
       frames become UNKNOWN.
 
-    Only frames within another signal's witnessed span count as evidence: a
-    lead-in or trailing guess can't corroborate or contradict another guess.
-    Mutates each ``states`` list in place.
+    Only genuinely witnessed frames of another signal count as evidence: a
+    lead-in, trailing, or merge-seam guess can't corroborate or contradict
+    another guess. Mutates each ``states`` list in place.
     """
     if frame_timestamps is None or len(frame_timestamps) == 0:
         return
@@ -313,7 +326,7 @@ def _resolve_traffic_light_lead_ins(
                 continue
             if float(np.linalg.norm(light.center - other.center)) > _TL_COLOCATED_DISTANCE_M:
                 continue
-            for frame in range(other.first_observed_frame, min(gap_frames, other.last_observed_end)):
+            for frame in other.witnessed_frames(0, gap_frames):
                 if other.states[frame] != guess:
                     contradicted = True
                     break
@@ -339,7 +352,8 @@ def _resolve_traffic_light_trailing_holds(
     labeler re-acquires the same physical head under a new track id (with enough
     position noise to defeat co-location): the old track keeps painting its old
     color on top of the new track's witnessed one. So the forward hold is vetted
-    exactly like the lead-in guess, against co-located signals' witnessed spans:
+    exactly like the lead-in guess, against co-located signals' genuinely
+    witnessed frames:
 
     - A co-located signal witnessing a DIFFERENT color during the hold proves the
       head had changed by that frame; the hold is cut there (later frames become
@@ -368,7 +382,7 @@ def _resolve_traffic_light_trailing_holds(
                 continue
             if float(np.linalg.norm(light.center - other.center)) > _TL_COLOCATED_DISTANCE_M:
                 continue
-            for frame in range(max(trail_start, other.first_observed_frame), min(num_frames, other.last_observed_end)):
+            for frame in other.witnessed_frames(trail_start, num_frames):
                 if other.states[frame] != guess:
                     contradiction_frame = min(contradiction_frame, frame)
                     break
@@ -1410,6 +1424,20 @@ class ClipGTLoader(SceneDataLoader):
                         states, frame_timestamps, seam_start_ts, member.t_first, member.first_state
                     )
                     seam_start_ts = max(seam_start_ts, member.t_last)
+                # A merged light is only genuinely witnessed inside each member
+                # fragment's own span; the seam frames between fragments hold
+                # guesses that must not vouch for other lights' guesses.
+                witnessed_intervals: Optional[List[Tuple[int, int]]] = None
+                if len(cluster) > 1 and frame_timestamps is not None and len(frame_timestamps) > 0:
+                    witnessed_intervals = []
+                    for member in cluster:
+                        lo = int(np.searchsorted(frame_timestamps, member.t_first, side="left"))
+                        hi = int(np.searchsorted(frame_timestamps, member.t_last, side="right"))
+                        if witnessed_intervals and lo <= witnessed_intervals[-1][1]:
+                            prev_lo, prev_hi = witnessed_intervals[-1]
+                            witnessed_intervals[-1] = (prev_lo, max(prev_hi, hi))
+                        else:
+                            witnessed_intervals.append((lo, hi))
                 pending.append(
                     _TrafficLightSequence(
                         center=center,
@@ -1417,6 +1445,7 @@ class ClipGTLoader(SceneDataLoader):
                         first_observed_frame=first_observed_frame,
                         last_observed_end=last_observed_end,
                         last_observed_ts=last_observed_ts,
+                        witnessed_intervals=witnessed_intervals,
                     )
                 )
                 traffic_light.metadata["state_sequence"] = states

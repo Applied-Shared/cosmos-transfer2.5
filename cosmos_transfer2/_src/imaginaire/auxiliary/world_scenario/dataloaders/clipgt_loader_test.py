@@ -464,6 +464,26 @@ def test_should_not_merge_disjoint_tracks_when_gap_exceeds_merge_window(monkeypa
     assert len(scene.traffic_lights) == 2
 
 
+def test_should_ignore_merge_seam_guess_as_evidence_for_colocated_light(monkeypatch):
+    # Precondition. Tracks 7+8 merge into one RED light whose seam (frames 2-6)
+    # holds unwitnessed guesses; light 9 shares the mast (co-located, facing 90
+    # degrees away so it can't merge itself) and is GREEN through t=1s.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(12)])
+    rows = [_light_row("7", t * 1_000_000, "RED", center=_NEAR) for t in (0, 1)]
+    rows += [_light_row("8", t * 1_000_000, "RED", center=_NEAR_COLOCATED) for t in (7, 8)]
+    third_center = {"x": 50.0, "y": 1.0, "z": 0.6}
+    rows += [_light_row("9", t * 1_000_000, "GREEN", center=third_center, orientation=_YAW_90) for t in (0, 1)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Light 9's trailing hold decays by its own 3s window; the
+    # seam's RED guess is not witnessed evidence, so it must not cut the hold.
+    assert len(scene.traffic_lights) == 2
+    third = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_9")
+    assert third.metadata["state_sequence"] == ["GREEN"] * 5 + [None] * 7
+
+
 def test_should_merge_colocated_disjoint_tracks_when_gap_within_window(monkeypatch):
     # Precondition. Fragments within the co-location radius, 3s apart: the 3D
     # tier merges them without needing the viewing-ray test.
