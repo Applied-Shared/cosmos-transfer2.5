@@ -16,7 +16,7 @@ unified SceneData representation.
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import pandas as pd
@@ -52,6 +52,349 @@ from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders.data_
 )
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.camera.ftheta import FThetaCamera
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.utils.laneline_utils import build_lane_line_type
+
+# An unwitnessed color is only assumed constant across a short window, in either
+# direction: real signal phases rarely last less than ~3 s (a yellow phase), so
+# extrapolating a color further than that from its nearest witness -- backward
+# into a lead-in or forward past the last observation -- is a coin flip. Forward,
+# the window also comfortably covers benign short occlusion gaps (observed real
+# gaps within a healthy track run well under 3 s), so held colors don't flicker.
+_TL_STATE_HOLD_MAX_MICROS = 3_000_000
+# Signals closer than this are treated as observing the same physical head (or
+# the same mast): duplicate track fragments of one head sit well within a couple
+# of meters of each other, while heads for different approaches sit farther apart.
+# The radius cannot be widened to catch every re-acquired fragment: genuinely
+# distinct heads (concurrently witnessed for many seconds) occur within ~4 m of
+# each other, while depth noise can put fragments of one head ~8 m apart.
+_TL_COLOCATED_DISTANCE_M = 2.5
+# A track starting within this window after another ends may be the same
+# physical head re-acquired under a new id. Two hold windows is the bound: it
+# spans every observed re-acquisition gap, and it guarantees the two nearest
+# witnesses' hold windows cover a merged seam end to end, so a merge never
+# introduces interior UNKNOWN frames. Concurrently witnessed tracks never
+# merge regardless of proximity: the labeler saw both heads lit at once.
+_TL_MERGE_MAX_GAP_MICROS = 2 * _TL_STATE_HOLD_MAX_MICROS
+# Depth on a small, distant, thin object is the auto-labeler's unreliable
+# axis: a re-acquired head can drift ~8 m in 3D, nearly all of it along the
+# viewing ray. Bearing survives that noise, so fragments of one head stay
+# within a fraction of a degree of the same ray (observed: 0.4 deg at ~55 m)
+# while genuinely distinct heads -- even on the same mast -- keep multi-degree
+# separation (observed: >= 2.2 deg). The distance cap rejects a farther head
+# that happens to line up with the same ray, e.g. the next signal down the
+# corridor near the vanishing point.
+_TL_MERGE_MAX_VIEW_ANGLE_DEG = 1.0
+_TL_MERGE_MAX_DISTANCE_M = 20.0
+# Heads serving other approaches can hang within a meter of each other (back
+# to back on one span wire, or on one pole corner) yet face elsewhere, so a
+# merge also requires roughly agreeing facings when both are known.
+_TL_MERGE_MAX_FACING_DEG = 45.0
+
+
+class _TrafficLightTrackFragment:
+    """One signal track's timed-observation summary: the unit of merge detection."""
+
+    def __init__(
+        self,
+        group_id: str,
+        t_first: int,
+        t_last: int,
+        first_state: str,
+        num_observations: int,
+        center: np.ndarray,
+        facing: Optional[np.ndarray],
+    ) -> None:
+        self.group_id = group_id
+        self.t_first = t_first
+        self.t_last = t_last
+        self.first_state = first_state
+        self.num_observations = num_observations
+        self.center = center
+        self.facing = facing
+
+
+def _traffic_light_facings_agree(facing_a: Optional[np.ndarray], facing_b: Optional[np.ndarray]) -> bool:
+    """Whether two facing unit vectors agree within ``_TL_MERGE_MAX_FACING_DEG``.
+
+    An unknown facing (identity-quaternion placeholder) doesn't block a merge:
+    only a witnessed disagreement is evidence of two distinct heads.
+    """
+    if facing_a is None or facing_b is None:
+        return True
+    return float(np.dot(facing_a, facing_b)) >= float(np.cos(np.radians(_TL_MERGE_MAX_FACING_DEG)))
+
+
+def _traffic_light_view_angle_deg(
+    center_a: np.ndarray,
+    center_b: np.ndarray,
+    reference_ts: float,
+    frame_timestamps: Optional[np.ndarray],
+    ego_positions: Optional[np.ndarray],
+) -> Optional[float]:
+    """Angle between the ego->center viewing rays at ``reference_ts``, in degrees.
+
+    This is screen-space proximity in camera-independent form: for any camera
+    at the ego position, two centers separated by a small bearing project to
+    (nearly) the same pixels, whatever their depths. Returns ``None`` when no
+    ego trajectory is available to anchor the rays.
+    """
+    if (
+        frame_timestamps is None
+        or len(frame_timestamps) == 0
+        or ego_positions is None
+        or len(ego_positions) == 0
+    ):
+        return None
+    frame = int(np.clip(np.searchsorted(frame_timestamps, reference_ts), 0, len(ego_positions) - 1))
+    ego = np.asarray(ego_positions[frame], dtype=np.float64)
+    ray_a = np.asarray(center_a, dtype=np.float64) - ego
+    ray_b = np.asarray(center_b, dtype=np.float64) - ego
+    norm_a = float(np.linalg.norm(ray_a))
+    norm_b = float(np.linalg.norm(ray_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return None
+    cos_angle = np.clip(np.dot(ray_a, ray_b) / (norm_a * norm_b), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _find_traffic_light_merge_clusters(
+    fragments: List[_TrafficLightTrackFragment],
+    frame_timestamps: Optional[np.ndarray],
+    ego_positions: Optional[np.ndarray],
+) -> List[List[_TrafficLightTrackFragment]]:
+    """Cluster track fragments that are very likely the same physical head.
+
+    The auto-labeler sometimes loses a signal and re-acquires it under a new
+    track id whose estimated 3D position has drifted along the viewing ray.
+    Left separate, the fragments each render a box -- two boxes for one
+    physical head. A fragment joins an existing cluster only when all hold:
+
+    - its observations start strictly after the cluster's last observation,
+      within ``_TL_MERGE_MAX_GAP_MICROS`` (a track that overlaps the cluster
+      in time is a genuinely distinct head, never a re-acquisition);
+    - some cluster member is spatially the same head: within
+      ``_TL_COLOCATED_DISTANCE_M`` in 3D, or within
+      ``_TL_MERGE_MAX_VIEW_ANGLE_DEG`` of the same viewing ray from the ego
+      at the gap midpoint while no farther than ``_TL_MERGE_MAX_DISTANCE_M``
+      (the angular test, not 3D distance, is what tolerates depth noise);
+    - that member's facing agrees with the fragment's when both are known.
+
+    Ambiguity between clusters resolves to the smallest viewing angle (or
+    smallest 3D distance when no ego trajectory is available -- angle
+    availability is uniform across one invocation, so the score units never
+    mix). Returns every fragment exactly once, grouped into clusters ordered
+    by first observation; unmerged fragments come back as singletons.
+    """
+    clusters: List[List[_TrafficLightTrackFragment]] = []
+    for fragment in sorted(fragments, key=lambda f: (f.t_first, f.group_id)):
+        best_cluster: Optional[List[_TrafficLightTrackFragment]] = None
+        best_score: Optional[float] = None
+        for cluster in clusters:
+            cluster_last_ts = max(member.t_last for member in cluster)
+            gap = fragment.t_first - cluster_last_ts
+            if not 0 < gap <= _TL_MERGE_MAX_GAP_MICROS:
+                continue
+            reference_ts = (cluster_last_ts + fragment.t_first) / 2.0
+            for member in cluster:
+                if not _traffic_light_facings_agree(member.facing, fragment.facing):
+                    continue
+                distance = float(np.linalg.norm(member.center - fragment.center))
+                if distance > _TL_MERGE_MAX_DISTANCE_M:
+                    continue
+                angle = _traffic_light_view_angle_deg(
+                    member.center, fragment.center, reference_ts, frame_timestamps, ego_positions
+                )
+                if distance > _TL_COLOCATED_DISTANCE_M and (
+                    angle is None or angle > _TL_MERGE_MAX_VIEW_ANGLE_DEG
+                ):
+                    continue
+                score = angle if angle is not None else distance
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_cluster = cluster
+        if best_cluster is not None:
+            best_cluster.append(fragment)
+        else:
+            clusters.append([fragment])
+    return clusters
+
+
+def _apply_traffic_light_merge_seam(
+    states: List[Optional[str]],
+    frame_timestamps: Optional[np.ndarray],
+    seam_start_ts: int,
+    seam_end_ts: int,
+    seam_end_state: str,
+) -> None:
+    """Rewrite the unwitnessed frames between two merged fragments' spans.
+
+    The sequence builder's hold-last fill carries the earlier fragment's final
+    color across the whole seam, which goes stale the moment the head actually
+    changed (unwitnessed). Instead, each seam frame takes its temporally
+    nearest witness's color -- the earlier fragment's last color up to the gap
+    midpoint, the later fragment's first color after it -- and only within
+    ``_TL_STATE_HOLD_MAX_MICROS`` of that witness (the same signal-phase bound
+    the lead-in and trailing windows use); frames supported by neither witness
+    become UNKNOWN. ``_TL_MERGE_MAX_GAP_MICROS`` currently guarantees the two
+    windows meet, so merged seams render fully colored. Mutates ``states``.
+    """
+    if frame_timestamps is None or len(frame_timestamps) == 0:
+        return
+    seam_mid_ts = (seam_start_ts + seam_end_ts) / 2.0
+    lo = int(np.searchsorted(frame_timestamps, seam_start_ts, side="right"))
+    hi = int(np.searchsorted(frame_timestamps, seam_end_ts, side="left"))
+    for frame in range(lo, min(hi, len(states))):
+        ts = int(frame_timestamps[frame])
+        if ts <= seam_mid_ts:
+            if ts - seam_start_ts > _TL_STATE_HOLD_MAX_MICROS:
+                states[frame] = None
+        else:
+            states[frame] = seam_end_state if seam_end_ts - ts <= _TL_STATE_HOLD_MAX_MICROS else None
+
+
+class _TrafficLightSequence:
+    """Per-signal state sequence plus what's needed to vet its unwitnessed guesses.
+
+    ``states[first_observed_frame:last_observed_end]`` spans first to last
+    observation. For a single track the whole span is witnessed (real
+    observations plus hold-last interpolation between them); for a merged light
+    only ``witnessed_intervals`` -- each member fragment's own span -- is, and
+    the seam frames between fragments carry midpoint-rule guesses (see
+    ``_apply_traffic_light_merge_seam``). Frames outside the span carry lead-in
+    / trailing guesses. The resolvers below decide whether each guess is kept;
+    guesses never count as evidence for other lights, so evidence scans must go
+    through ``witnessed_frames`` rather than the raw span.
+    """
+
+    def __init__(
+        self,
+        center: np.ndarray,
+        states: List[Optional[str]],
+        first_observed_frame: int,
+        last_observed_end: int,
+        last_observed_ts: Optional[int],
+        witnessed_intervals: Optional[List[Tuple[int, int]]] = None,
+    ) -> None:
+        self.center = center
+        self.states = states
+        self.first_observed_frame = first_observed_frame
+        self.last_observed_end = last_observed_end
+        self.last_observed_ts = last_observed_ts
+        self.witnessed_intervals = witnessed_intervals or [(first_observed_frame, last_observed_end)]
+
+    def witnessed_frames(self, lo: int, hi: int) -> Iterator[int]:
+        """Genuinely witnessed frame indices within ``[lo, hi)``, ascending."""
+        for start, end in self.witnessed_intervals:
+            yield from range(max(start, lo), min(end, hi))
+
+
+def _resolve_traffic_light_lead_ins(
+    lights: List[_TrafficLightSequence], frame_timestamps: Optional[np.ndarray]
+) -> None:
+    """Decide how much of each signal's leading-frame color guess to keep.
+
+    Frames before a signal's first observation carry its first observed color as
+    a guess, not data. A guess is only trustworthy as far back as evidence
+    supports it, so for each signal with a lead-in gap this weighs the states
+    that co-located signals (within ``_TL_COLOCATED_DISTANCE_M`` -- duplicate
+    track fragments or heads on the same mast) actually observed during the gap:
+
+    - Any co-located signal showing a DIFFERENT color during the gap means the
+      guess is wrong for part of the gap, and rendering it would draw two
+      contradictory boxes on one physical head. The whole lead-in becomes
+      UNKNOWN (``None`` entries, rendered gray).
+    - A co-located signal showing the SAME color pushes the witnessed boundary
+      back to that evidence, keeping the guess through the corroborated span.
+    - With no evidence either way, the guess is kept only for
+      ``_TL_STATE_HOLD_MAX_MICROS`` before the earliest witness; earlier
+      frames become UNKNOWN.
+
+    Only genuinely witnessed frames of another signal count as evidence: a
+    lead-in, trailing, or merge-seam guess can't corroborate or contradict
+    another guess. Mutates each ``states`` list in place.
+    """
+    if frame_timestamps is None or len(frame_timestamps) == 0:
+        return
+    for light in lights:
+        gap_frames = min(light.first_observed_frame, len(light.states))
+        if gap_frames <= 0:
+            continue
+        guess = light.states[0]
+        contradicted = False
+        witnessed_frame = gap_frames  # frame index of the earliest supporting evidence
+        for other in lights:
+            if other is light:
+                continue
+            if float(np.linalg.norm(light.center - other.center)) > _TL_COLOCATED_DISTANCE_M:
+                continue
+            for frame in other.witnessed_frames(0, gap_frames):
+                if other.states[frame] != guess:
+                    contradicted = True
+                    break
+                witnessed_frame = min(witnessed_frame, frame)
+            if contradicted:
+                break
+        if contradicted:
+            light.states[:gap_frames] = [None] * gap_frames
+            continue
+        witnessed_ts = int(frame_timestamps[min(witnessed_frame, len(frame_timestamps) - 1)])
+        for frame in range(gap_frames):
+            if int(frame_timestamps[frame]) < witnessed_ts - _TL_STATE_HOLD_MAX_MICROS:
+                light.states[frame] = None
+
+
+def _resolve_traffic_light_trailing_holds(
+    lights: List[_TrafficLightSequence], frame_timestamps: Optional[np.ndarray]
+) -> None:
+    """Decide how much of each signal's trailing hold-forward guess to keep.
+
+    Frames after a signal's last observation carry its last observed color as a
+    guess, not data. Held forever, a stale guess overlaps reality when the
+    labeler re-acquires the same physical head under a new track id (with enough
+    position noise to defeat co-location): the old track keeps painting its old
+    color on top of the new track's witnessed one. So the forward hold is vetted
+    exactly like the lead-in guess, against co-located signals' genuinely
+    witnessed frames:
+
+    - A co-located signal witnessing a DIFFERENT color during the hold proves the
+      head had changed by that frame; the hold is cut there (later frames become
+      UNKNOWN). Frames the window keeps before the change stay: the color was
+      still witnessed-true at the hold's start.
+    - A co-located signal witnessing the SAME color pushes the witnessed
+      boundary forward, keeping the hold through the corroborated span.
+    - Beyond the latest supporting witness the guess survives only
+      ``_TL_STATE_HOLD_MAX_MICROS``; later frames become UNKNOWN.
+
+    UNKNOWN clears only the color: the light keeps rendering as a gray box, so
+    presence is unaffected. Mutates each ``states`` list in place.
+    """
+    if frame_timestamps is None or len(frame_timestamps) == 0:
+        return
+    for light in lights:
+        num_frames = len(light.states)
+        trail_start = light.last_observed_end
+        if trail_start >= num_frames or light.last_observed_ts is None:
+            continue
+        guess = light.states[trail_start]
+        contradiction_frame = num_frames
+        corroborated_frames: List[int] = []
+        for other in lights:
+            if other is light:
+                continue
+            if float(np.linalg.norm(light.center - other.center)) > _TL_COLOCATED_DISTANCE_M:
+                continue
+            for frame in other.witnessed_frames(trail_start, num_frames):
+                if other.states[frame] != guess:
+                    contradiction_frame = min(contradiction_frame, frame)
+                    break
+                corroborated_frames.append(frame)
+        # Corroboration past a proven change can't resurrect the hold.
+        witnessed_ts = int(light.last_observed_ts)
+        for frame in corroborated_frames:
+            if frame < contradiction_frame:
+                witnessed_ts = max(witnessed_ts, int(frame_timestamps[frame]))
+        for frame in range(trail_start, num_frames):
+            if frame >= contradiction_frame or int(frame_timestamps[frame]) > witnessed_ts + _TL_STATE_HOLD_MAX_MICROS:
+                light.states[frame] = None
 
 
 @auto_register(priority=10)  # High priority for ClipGT format
@@ -940,14 +1283,32 @@ class ClipGTLoader(SceneDataLoader):
         signal that changes color mid-clip becomes a single light whose
         ``metadata["state_sequence"]`` steps through its colors, aligned onto the
         ego/render frame grid by holding the last observed state between updates.
+        Frames outside a signal's witnessed span carry its nearest observed color
+        only as far as corroborating evidence supports (see
+        ``_resolve_traffic_light_lead_ins`` and
+        ``_resolve_traffic_light_trailing_holds``); beyond that they stay UNKNOWN.
         A signal with no usable state stays UNKNOWN (gray). Orientation is
         optional: a missing or null quaternion falls back to identity instead of
         raising.
+
+        Before lights are built, temporally disjoint tracks that are very
+        likely re-acquisitions of one physical head (see
+        ``_find_traffic_light_merge_clusters``) collapse into a single light
+        with one continuous state timeline, so exactly one box renders per
+        physical head; the unwitnessed seam between two merged fragments takes
+        each side's nearest witnessed color (see
+        ``_apply_traffic_light_merge_seam``).
         """
         df = pd.read_parquet(traffic_light_file)
 
         num_frames = max(1, scene_data.num_frames)
         frame_timestamps = scene_data.timestamps  # microseconds, one per frame
+        ego_positions = (
+            np.array([pose.position for pose in scene_data.ego_poses], dtype=np.float64)
+            if scene_data.ego_poses
+            else None
+        )
+        pending: List[_TrafficLightSequence] = []
 
         # Group rows by the stable per-signal id so multiple per-timestamp rows
         # collapse into one light. Fall back to the row index when the key is
@@ -961,8 +1322,11 @@ class ClipGTLoader(SceneDataLoader):
             group_id = str(label_id) if label_id is not None else f"row_{idx}"
             grouped[group_id].append((timestamp, light))
 
+        # Geometry is static per signal: parse it once per group, from the
+        # group's first observation.
+        geometry: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = {}
+        fragments: List[_TrafficLightTrackFragment] = []
         for group_id, observations in grouped.items():
-            # Geometry is static per signal: parse it from the first observation.
             light = observations[0][1]
 
             center = np.array(
@@ -995,7 +1359,49 @@ class ClipGTLoader(SceneDataLoader):
 
             center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
             orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
+            geometry[group_id] = (center, dimensions, orientation, orientation_known)
 
+            # Same facing convention as the renderer's cull: local +x axis.
+            facing = Rotation.from_quat(orientation).apply([1.0, 0.0, 0.0]) if orientation_known else None
+            timed = sorted(
+                (int(ts), obs.get("state"))
+                for ts, obs in observations
+                if ts is not None and isinstance(obs.get("state"), str) and obs.get("state").strip()
+            )
+            if timed:
+                fragments.append(
+                    _TrafficLightTrackFragment(
+                        group_id=group_id,
+                        t_first=timed[0][0],
+                        t_last=timed[-1][0],
+                        first_state=timed[0][1],
+                        num_observations=len(timed),
+                        center=center,
+                        facing=facing,
+                    )
+                )
+
+        clusters = _find_traffic_light_merge_clusters(fragments, frame_timestamps, ego_positions)
+        # The best-witnessed fragment names the merged light and provides its
+        # rendered geometry; the other fragments' rows only feed its timeline.
+        primary_of: Dict[str, str] = {}
+        cluster_of_primary: Dict[str, List[_TrafficLightTrackFragment]] = {}
+        for cluster in clusters:
+            primary = max(cluster, key=lambda f: (f.num_observations, f.t_last - f.t_first, f.group_id))
+            cluster_of_primary[primary.group_id] = cluster
+            for member in cluster:
+                primary_of[member.group_id] = primary.group_id
+
+        for group_id in grouped:
+            if group_id not in geometry:
+                continue
+            if primary_of.get(group_id, group_id) != group_id:
+                continue  # absorbed into another fragment's light
+            cluster = cluster_of_primary.get(group_id, [])
+            member_ids = [member.group_id for member in cluster] or [group_id]
+            observations = [obs for member_id in member_ids for obs in grouped[member_id]]
+
+            center, dimensions, orientation, orientation_known = geometry[group_id]
             traffic_light = TrafficLight(
                 element_id=f"traffic_light_{group_id}",
                 center=center,
@@ -1003,33 +1409,74 @@ class ClipGTLoader(SceneDataLoader):
                 orientation=orientation,
             )
             traffic_light.metadata["orientation_known"] = orientation_known
+            if len(member_ids) > 1:
+                traffic_light.metadata["merged_track_ids"] = member_ids
 
             # Build the per-frame color sequence. Timestamped observations step
             # through colors aligned to the frame grid (hold-last); a single
             # untimed row broadcasts its state. An absent state stays gray.
-            state_sequence = self._build_traffic_light_state_sequence(
-                observations, frame_timestamps, num_frames
-            )
-            if state_sequence is not None:
-                traffic_light.metadata["state_sequence"] = state_sequence
+            built = self._build_traffic_light_state_sequence(observations, frame_timestamps, num_frames)
+            if built is not None:
+                states, first_observed_frame, last_observed_end, last_observed_ts = built
+                seam_start_ts = cluster[0].t_last if cluster else 0
+                for member in cluster[1:]:
+                    _apply_traffic_light_merge_seam(
+                        states, frame_timestamps, seam_start_ts, member.t_first, member.first_state
+                    )
+                    seam_start_ts = max(seam_start_ts, member.t_last)
+                # A merged light is only genuinely witnessed inside each member
+                # fragment's own span; the seam frames between fragments hold
+                # guesses that must not vouch for other lights' guesses.
+                witnessed_intervals: Optional[List[Tuple[int, int]]] = None
+                if len(cluster) > 1 and frame_timestamps is not None and len(frame_timestamps) > 0:
+                    witnessed_intervals = []
+                    for member in cluster:
+                        lo = int(np.searchsorted(frame_timestamps, member.t_first, side="left"))
+                        hi = int(np.searchsorted(frame_timestamps, member.t_last, side="right"))
+                        if witnessed_intervals and lo <= witnessed_intervals[-1][1]:
+                            prev_lo, prev_hi = witnessed_intervals[-1]
+                            witnessed_intervals[-1] = (prev_lo, max(prev_hi, hi))
+                        else:
+                            witnessed_intervals.append((lo, hi))
+                pending.append(
+                    _TrafficLightSequence(
+                        center=center,
+                        states=states,
+                        first_observed_frame=first_observed_frame,
+                        last_observed_end=last_observed_end,
+                        last_observed_ts=last_observed_ts,
+                        witnessed_intervals=witnessed_intervals,
+                    )
+                )
+                traffic_light.metadata["state_sequence"] = states
 
             scene_data.traffic_lights.append(traffic_light)
+
+        _resolve_traffic_light_lead_ins(pending, frame_timestamps)
+        _resolve_traffic_light_trailing_holds(pending, frame_timestamps)
 
     @staticmethod
     def _build_traffic_light_state_sequence(
         observations: List[Tuple[Optional[int], Dict[str, Any]]],
         frame_timestamps: np.ndarray,
         num_frames: int,
-    ) -> Optional[List[str]]:
+    ) -> Optional[Tuple[List[Optional[str]], int, int, Optional[int]]]:
         """Build a length-``num_frames`` list of traffic-light state strings.
 
         ``observations`` are ``(timestamp_micros, light)`` tuples for one signal.
         Observations carrying a usable state and a timestamp are sorted and mapped
         onto ``frame_timestamps`` by holding the most recent state at or before
-        each frame (leading frames clamp to the first observation). When no
-        observation carries a timestamp, the single representative state is
-        broadcast across all frames. Returns ``None`` when the signal has no
-        usable (non-empty string) state, leaving the light UNKNOWN (gray).
+        each frame; frames outside the observed span provisionally carry the
+        nearest observed state (``_resolve_traffic_light_lead_ins`` and
+        ``_resolve_traffic_light_trailing_holds`` decide how much of those
+        guesses to keep). When no observation carries a timestamp, the single
+        representative state is broadcast across all frames. Returns ``(states,
+        first_observed_frame, last_observed_end, last_observed_ts)`` where frames
+        before ``first_observed_frame`` or at/after ``last_observed_end`` are
+        guesses rather than observations and ``last_observed_ts`` is the last
+        observation's timestamp (``None`` for broadcast states), or ``None`` when
+        the signal has no usable (non-empty string) state, leaving the light
+        UNKNOWN (gray).
         """
         timed: List[Tuple[int, str]] = []
         untimed_state: Optional[str] = None
@@ -1048,15 +1495,17 @@ class ClipGTLoader(SceneDataLoader):
             observed_states = [state for _, state in timed]
             if frame_timestamps is None or len(frame_timestamps) == 0:
                 # No frame grid to align to: hold the earliest observed state.
-                return [observed_states[0]] * num_frames
-            # Most recent observation at or before each frame; clamp leading
-            # frames (before the first observation) to the first state.
+                return [observed_states[0]] * num_frames, 0, num_frames, None
+            # Most recent observation at or before each frame; frames before the
+            # first observation provisionally take the first state.
             indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
             indices = np.clip(indices, 0, len(observed_states) - 1)
-            return [observed_states[int(i)] for i in indices]
+            first_observed_frame = int(np.searchsorted(frame_timestamps, observed_ts[0], side="left"))
+            last_observed_end = int(np.searchsorted(frame_timestamps, observed_ts[-1], side="right"))
+            return [observed_states[int(i)] for i in indices], first_observed_frame, last_observed_end, int(observed_ts[-1])
 
         if untimed_state is not None:
-            return [untimed_state] * num_frames
+            return [untimed_state] * num_frames, 0, num_frames, None
 
         return None
 
