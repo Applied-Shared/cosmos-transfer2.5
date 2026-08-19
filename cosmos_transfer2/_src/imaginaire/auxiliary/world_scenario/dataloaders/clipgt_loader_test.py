@@ -221,8 +221,8 @@ def test_should_broadcast_when_label_present_but_timestamp_null(monkeypatch):
     assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 3
 
 
-def _light_row(label_id, timestamp, state, center=None):
-    light = {"center": center or _CENTER, "orientation": _IDENTITY, "state": state}
+def _light_row(label_id, timestamp, state, center=None, orientation=None):
+    light = {"center": center or _CENTER, "orientation": orientation or _IDENTITY, "state": state}
     return {"traffic_light": light, "key": _key(label_id, timestamp)}
 
 
@@ -364,3 +364,116 @@ def test_should_not_use_far_signal_as_trailing_evidence(monkeypatch):
     # Postcondition. No corroboration applied; the plain hold window governs.
     early = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_7")
     assert early.metadata["state_sequence"] == ["RED"] * 2 + [None] * 9
+
+
+# Merge fixtures: ego sits at the origin, so a fragment at 50m forward and a
+# re-acquisition ~8m deeper along almost the same bearing model the labeler's
+# depth drift on a small distant head.
+_NEAR = {"x": 50.0, "y": 0.0, "z": 0.0}
+_DEEP_SAME_RAY = {"x": 58.0, "y": 0.5, "z": 0.6}  # 8m away in 3D, <1 deg off the ray
+_NEAR_OFF_RAY = {"x": 50.0, "y": 8.0, "z": 0.0}  # 8m away in 3D, ~9 deg off the ray
+_NEAR_COLOCATED = {"x": 50.0, "y": 0.5, "z": 0.6}  # within the co-location radius
+_YAW_90 = {"x": 0.0, "y": 0.0, "z": 0.70710678, "w": 0.70710678}
+
+
+def test_should_merge_disjoint_tracks_when_on_shared_viewing_ray(monkeypatch):
+    # Precondition. Track 7 ends at t=1s; track 8 re-acquires at t=5s, 8m deeper
+    # in 3D but under 1 degree off the same viewing ray from the ego.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR), _light_row("7", 1_000_000, "RED", center=_NEAR)]
+    rows += [_light_row("8", (5 + i) * 1_000_000, "GREEN", center=_DEEP_SAME_RAY) for i in range(5)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. One light (named for the better-witnessed fragment), not two.
+    assert len(scene.traffic_lights) == 1
+    assert scene.traffic_lights[0].element_id == "traffic_light_8"
+    assert scene.traffic_lights[0].metadata["merged_track_ids"] == ["7", "8"]
+
+
+def test_should_split_merged_seam_colors_at_gap_midpoint(monkeypatch):
+    # Precondition. Merged fragments RED-until-1s and GREEN-from-7s: the 6s seam
+    # is unwitnessed, and the midpoint (t=4s) is where the nearest witness flips.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR), _light_row("7", 1_000_000, "RED", center=_NEAR)]
+    rows += [_light_row("8", (7 + i) * 1_000_000, "GREEN", center=_DEEP_SAME_RAY) for i in range(3)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Each seam frame carries its temporally nearest witness's color.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 5 + ["GREEN"] * 5
+
+
+def test_should_not_merge_tracks_when_temporally_overlapping(monkeypatch):
+    # Precondition. Both tracks are witnessed simultaneously (overlap 5-6s): two
+    # genuinely distinct heads, even though they sit on almost the same ray.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR), _light_row("7", 6_000_000, "RED", center=_NEAR)]
+    rows += [_light_row("8", (5 + i) * 1_000_000, "GREEN", center=_DEEP_SAME_RAY) for i in range(5)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition.
+    assert len(scene.traffic_lights) == 2
+
+
+def test_should_not_merge_disjoint_tracks_when_off_shared_viewing_ray(monkeypatch):
+    # Precondition. Same 8m separation and timing as the merge case, but lateral:
+    # ~9 degrees off the ray, the signature of a different head, not depth noise.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR), _light_row("7", 1_000_000, "RED", center=_NEAR)]
+    rows += [_light_row("8", (5 + i) * 1_000_000, "GREEN", center=_NEAR_OFF_RAY) for i in range(5)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition.
+    assert len(scene.traffic_lights) == 2
+
+
+def test_should_not_merge_disjoint_tracks_when_facings_disagree(monkeypatch):
+    # Precondition. Co-located and disjoint, but facing 90 degrees apart -- e.g.
+    # heads for two approaches sharing one pole corner.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR), _light_row("7", 1_000_000, "RED", center=_NEAR)]
+    rows += [
+        _light_row("8", (5 + i) * 1_000_000, "GREEN", center=_NEAR_COLOCATED, orientation=_YAW_90)
+        for i in range(5)
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition.
+    assert len(scene.traffic_lights) == 2
+
+
+def test_should_not_merge_disjoint_tracks_when_gap_exceeds_merge_window(monkeypatch):
+    # Precondition. Co-located, same facing, but silent for 7s between tracks.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR)]
+    rows += [_light_row("8", (7 + i) * 1_000_000, "RED", center=_NEAR_COLOCATED) for i in range(3)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition.
+    assert len(scene.traffic_lights) == 2
+
+
+def test_should_merge_colocated_disjoint_tracks_when_gap_within_window(monkeypatch):
+    # Precondition. Fragments within the co-location radius, 3s apart: the 3D
+    # tier merges them without needing the viewing-ray test.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED", center=_NEAR), _light_row("7", 1_000_000, "RED", center=_NEAR)]
+    rows += [_light_row("8", (4 + i) * 1_000_000, "RED", center=_NEAR_COLOCATED) for i in range(6)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. One light, one uninterrupted color.
+    assert len(scene.traffic_lights) == 1
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 10

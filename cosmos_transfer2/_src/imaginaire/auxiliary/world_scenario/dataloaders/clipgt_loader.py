@@ -67,6 +67,188 @@ _TL_STATE_HOLD_MAX_MICROS = 3_000_000
 # distinct heads (concurrently witnessed for many seconds) occur within ~4 m of
 # each other, while depth noise can put fragments of one head ~8 m apart.
 _TL_COLOCATED_DISTANCE_M = 2.5
+# A track starting within this window after another ends may be the same
+# physical head re-acquired under a new id. Two hold windows is the bound: it
+# spans every observed re-acquisition gap, and it guarantees the two nearest
+# witnesses' hold windows cover a merged seam end to end, so a merge never
+# introduces interior UNKNOWN frames. Concurrently witnessed tracks never
+# merge regardless of proximity: the labeler saw both heads lit at once.
+_TL_MERGE_MAX_GAP_MICROS = 2 * _TL_STATE_HOLD_MAX_MICROS
+# Depth on a small, distant, thin object is the auto-labeler's unreliable
+# axis: a re-acquired head can drift ~8 m in 3D, nearly all of it along the
+# viewing ray. Bearing survives that noise, so fragments of one head stay
+# within a fraction of a degree of the same ray (observed: 0.4 deg at ~55 m)
+# while genuinely distinct heads -- even on the same mast -- keep multi-degree
+# separation (observed: >= 2.2 deg). The distance cap rejects a farther head
+# that happens to line up with the same ray, e.g. the next signal down the
+# corridor near the vanishing point.
+_TL_MERGE_MAX_VIEW_ANGLE_DEG = 1.0
+_TL_MERGE_MAX_DISTANCE_M = 20.0
+# Heads serving other approaches can hang within a meter of each other (back
+# to back on one span wire, or on one pole corner) yet face elsewhere, so a
+# merge also requires roughly agreeing facings when both are known.
+_TL_MERGE_MAX_FACING_DEG = 45.0
+
+
+class _TrafficLightTrackFragment:
+    """One signal track's timed-observation summary: the unit of merge detection."""
+
+    def __init__(
+        self,
+        group_id: str,
+        t_first: int,
+        t_last: int,
+        first_state: str,
+        num_observations: int,
+        center: np.ndarray,
+        facing: Optional[np.ndarray],
+    ) -> None:
+        self.group_id = group_id
+        self.t_first = t_first
+        self.t_last = t_last
+        self.first_state = first_state
+        self.num_observations = num_observations
+        self.center = center
+        self.facing = facing
+
+
+def _traffic_light_facings_agree(facing_a: Optional[np.ndarray], facing_b: Optional[np.ndarray]) -> bool:
+    """Whether two facing unit vectors agree within ``_TL_MERGE_MAX_FACING_DEG``.
+
+    An unknown facing (identity-quaternion placeholder) doesn't block a merge:
+    only a witnessed disagreement is evidence of two distinct heads.
+    """
+    if facing_a is None or facing_b is None:
+        return True
+    return float(np.dot(facing_a, facing_b)) >= float(np.cos(np.radians(_TL_MERGE_MAX_FACING_DEG)))
+
+
+def _traffic_light_view_angle_deg(
+    center_a: np.ndarray,
+    center_b: np.ndarray,
+    reference_ts: float,
+    frame_timestamps: Optional[np.ndarray],
+    ego_positions: Optional[np.ndarray],
+) -> Optional[float]:
+    """Angle between the ego->center viewing rays at ``reference_ts``, in degrees.
+
+    This is screen-space proximity in camera-independent form: for any camera
+    at the ego position, two centers separated by a small bearing project to
+    (nearly) the same pixels, whatever their depths. Returns ``None`` when no
+    ego trajectory is available to anchor the rays.
+    """
+    if (
+        frame_timestamps is None
+        or len(frame_timestamps) == 0
+        or ego_positions is None
+        or len(ego_positions) == 0
+    ):
+        return None
+    frame = int(np.clip(np.searchsorted(frame_timestamps, reference_ts), 0, len(ego_positions) - 1))
+    ego = np.asarray(ego_positions[frame], dtype=np.float64)
+    ray_a = np.asarray(center_a, dtype=np.float64) - ego
+    ray_b = np.asarray(center_b, dtype=np.float64) - ego
+    norm_a = float(np.linalg.norm(ray_a))
+    norm_b = float(np.linalg.norm(ray_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return None
+    cos_angle = np.clip(np.dot(ray_a, ray_b) / (norm_a * norm_b), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def _find_traffic_light_merge_clusters(
+    fragments: List[_TrafficLightTrackFragment],
+    frame_timestamps: Optional[np.ndarray],
+    ego_positions: Optional[np.ndarray],
+) -> List[List[_TrafficLightTrackFragment]]:
+    """Cluster track fragments that are very likely the same physical head.
+
+    The auto-labeler sometimes loses a signal and re-acquires it under a new
+    track id whose estimated 3D position has drifted along the viewing ray.
+    Left separate, the fragments each render a box -- two boxes for one
+    physical head. A fragment joins an existing cluster only when all hold:
+
+    - its observations start strictly after the cluster's last observation,
+      within ``_TL_MERGE_MAX_GAP_MICROS`` (a track that overlaps the cluster
+      in time is a genuinely distinct head, never a re-acquisition);
+    - some cluster member is spatially the same head: within
+      ``_TL_COLOCATED_DISTANCE_M`` in 3D, or within
+      ``_TL_MERGE_MAX_VIEW_ANGLE_DEG`` of the same viewing ray from the ego
+      at the gap midpoint while no farther than ``_TL_MERGE_MAX_DISTANCE_M``
+      (the angular test, not 3D distance, is what tolerates depth noise);
+    - that member's facing agrees with the fragment's when both are known.
+
+    Ambiguity between clusters resolves to the smallest viewing angle (or
+    smallest 3D distance when no ego trajectory is available -- angle
+    availability is uniform across one invocation, so the score units never
+    mix). Returns every fragment exactly once, grouped into clusters ordered
+    by first observation; unmerged fragments come back as singletons.
+    """
+    clusters: List[List[_TrafficLightTrackFragment]] = []
+    for fragment in sorted(fragments, key=lambda f: (f.t_first, f.group_id)):
+        best_cluster: Optional[List[_TrafficLightTrackFragment]] = None
+        best_score: Optional[float] = None
+        for cluster in clusters:
+            cluster_last_ts = max(member.t_last for member in cluster)
+            gap = fragment.t_first - cluster_last_ts
+            if not 0 < gap <= _TL_MERGE_MAX_GAP_MICROS:
+                continue
+            reference_ts = (cluster_last_ts + fragment.t_first) / 2.0
+            for member in cluster:
+                if not _traffic_light_facings_agree(member.facing, fragment.facing):
+                    continue
+                distance = float(np.linalg.norm(member.center - fragment.center))
+                if distance > _TL_MERGE_MAX_DISTANCE_M:
+                    continue
+                angle = _traffic_light_view_angle_deg(
+                    member.center, fragment.center, reference_ts, frame_timestamps, ego_positions
+                )
+                if distance > _TL_COLOCATED_DISTANCE_M and (
+                    angle is None or angle > _TL_MERGE_MAX_VIEW_ANGLE_DEG
+                ):
+                    continue
+                score = angle if angle is not None else distance
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_cluster = cluster
+        if best_cluster is not None:
+            best_cluster.append(fragment)
+        else:
+            clusters.append([fragment])
+    return clusters
+
+
+def _apply_traffic_light_merge_seam(
+    states: List[Optional[str]],
+    frame_timestamps: Optional[np.ndarray],
+    seam_start_ts: int,
+    seam_end_ts: int,
+    seam_end_state: str,
+) -> None:
+    """Rewrite the unwitnessed frames between two merged fragments' spans.
+
+    The sequence builder's hold-last fill carries the earlier fragment's final
+    color across the whole seam, which goes stale the moment the head actually
+    changed (unwitnessed). Instead, each seam frame takes its temporally
+    nearest witness's color -- the earlier fragment's last color up to the gap
+    midpoint, the later fragment's first color after it -- and only within
+    ``_TL_STATE_HOLD_MAX_MICROS`` of that witness (the same signal-phase bound
+    the lead-in and trailing windows use); frames supported by neither witness
+    become UNKNOWN. ``_TL_MERGE_MAX_GAP_MICROS`` currently guarantees the two
+    windows meet, so merged seams render fully colored. Mutates ``states``.
+    """
+    if frame_timestamps is None or len(frame_timestamps) == 0:
+        return
+    seam_mid_ts = (seam_start_ts + seam_end_ts) / 2.0
+    lo = int(np.searchsorted(frame_timestamps, seam_start_ts, side="right"))
+    hi = int(np.searchsorted(frame_timestamps, seam_end_ts, side="left"))
+    for frame in range(lo, min(hi, len(states))):
+        ts = int(frame_timestamps[frame])
+        if ts <= seam_mid_ts:
+            if ts - seam_start_ts > _TL_STATE_HOLD_MAX_MICROS:
+                states[frame] = None
+        else:
+            states[frame] = seam_end_state if seam_end_ts - ts <= _TL_STATE_HOLD_MAX_MICROS else None
 
 
 class _TrafficLightSequence:
@@ -1094,11 +1276,24 @@ class ClipGTLoader(SceneDataLoader):
         A signal with no usable state stays UNKNOWN (gray). Orientation is
         optional: a missing or null quaternion falls back to identity instead of
         raising.
+
+        Before lights are built, temporally disjoint tracks that are very
+        likely re-acquisitions of one physical head (see
+        ``_find_traffic_light_merge_clusters``) collapse into a single light
+        with one continuous state timeline, so exactly one box renders per
+        physical head; the unwitnessed seam between two merged fragments takes
+        each side's nearest witnessed color (see
+        ``_apply_traffic_light_merge_seam``).
         """
         df = pd.read_parquet(traffic_light_file)
 
         num_frames = max(1, scene_data.num_frames)
         frame_timestamps = scene_data.timestamps  # microseconds, one per frame
+        ego_positions = (
+            np.array([pose.position for pose in scene_data.ego_poses], dtype=np.float64)
+            if scene_data.ego_poses
+            else None
+        )
         pending: List[_TrafficLightSequence] = []
 
         # Group rows by the stable per-signal id so multiple per-timestamp rows
@@ -1113,8 +1308,11 @@ class ClipGTLoader(SceneDataLoader):
             group_id = str(label_id) if label_id is not None else f"row_{idx}"
             grouped[group_id].append((timestamp, light))
 
+        # Geometry is static per signal: parse it once per group, from the
+        # group's first observation.
+        geometry: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = {}
+        fragments: List[_TrafficLightTrackFragment] = []
         for group_id, observations in grouped.items():
-            # Geometry is static per signal: parse it from the first observation.
             light = observations[0][1]
 
             center = np.array(
@@ -1147,7 +1345,49 @@ class ClipGTLoader(SceneDataLoader):
 
             center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
             orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
+            geometry[group_id] = (center, dimensions, orientation, orientation_known)
 
+            # Same facing convention as the renderer's cull: local +x axis.
+            facing = Rotation.from_quat(orientation).apply([1.0, 0.0, 0.0]) if orientation_known else None
+            timed = sorted(
+                (int(ts), obs.get("state"))
+                for ts, obs in observations
+                if ts is not None and isinstance(obs.get("state"), str) and obs.get("state").strip()
+            )
+            if timed:
+                fragments.append(
+                    _TrafficLightTrackFragment(
+                        group_id=group_id,
+                        t_first=timed[0][0],
+                        t_last=timed[-1][0],
+                        first_state=timed[0][1],
+                        num_observations=len(timed),
+                        center=center,
+                        facing=facing,
+                    )
+                )
+
+        clusters = _find_traffic_light_merge_clusters(fragments, frame_timestamps, ego_positions)
+        # The best-witnessed fragment names the merged light and provides its
+        # rendered geometry; the other fragments' rows only feed its timeline.
+        primary_of: Dict[str, str] = {}
+        cluster_of_primary: Dict[str, List[_TrafficLightTrackFragment]] = {}
+        for cluster in clusters:
+            primary = max(cluster, key=lambda f: (f.num_observations, f.t_last - f.t_first, f.group_id))
+            cluster_of_primary[primary.group_id] = cluster
+            for member in cluster:
+                primary_of[member.group_id] = primary.group_id
+
+        for group_id in grouped:
+            if group_id not in geometry:
+                continue
+            if primary_of.get(group_id, group_id) != group_id:
+                continue  # absorbed into another fragment's light
+            cluster = cluster_of_primary.get(group_id, [])
+            member_ids = [member.group_id for member in cluster] or [group_id]
+            observations = [obs for member_id in member_ids for obs in grouped[member_id]]
+
+            center, dimensions, orientation, orientation_known = geometry[group_id]
             traffic_light = TrafficLight(
                 element_id=f"traffic_light_{group_id}",
                 center=center,
@@ -1155,6 +1395,8 @@ class ClipGTLoader(SceneDataLoader):
                 orientation=orientation,
             )
             traffic_light.metadata["orientation_known"] = orientation_known
+            if len(member_ids) > 1:
+                traffic_light.metadata["merged_track_ids"] = member_ids
 
             # Build the per-frame color sequence. Timestamped observations step
             # through colors aligned to the frame grid (hold-last); a single
@@ -1162,6 +1404,12 @@ class ClipGTLoader(SceneDataLoader):
             built = self._build_traffic_light_state_sequence(observations, frame_timestamps, num_frames)
             if built is not None:
                 states, first_observed_frame, last_observed_end, last_observed_ts = built
+                seam_start_ts = cluster[0].t_last if cluster else 0
+                for member in cluster[1:]:
+                    _apply_traffic_light_merge_seam(
+                        states, frame_timestamps, seam_start_ts, member.t_first, member.first_state
+                    )
+                    seam_start_ts = max(seam_start_ts, member.t_last)
                 pending.append(
                     _TrafficLightSequence(
                         center=center,
