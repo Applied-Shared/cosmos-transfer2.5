@@ -288,3 +288,79 @@ def test_should_not_use_far_signal_as_lead_in_evidence(monkeypatch):
     # Postcondition. No contradiction applied; the plain backfill window governs.
     late = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_8")
     assert late.metadata["state_sequence"] == [None] * 6 + ["GREEN"] * 4
+
+
+def test_should_decay_trailing_hold_when_silence_exceeds_hold_window(monkeypatch):
+    # Precondition. A signal observed only at t=0, then silent for 9s.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, [_light_row("7", 0, "RED")])
+
+    # Postcondition. The color survives the 3s hold window, then goes UNKNOWN.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 4 + [None] * 6
+
+
+def test_should_keep_trailing_hold_when_silence_within_window(monkeypatch):
+    # Precondition. Last observation 2s before clip end -- inside the hold window.
+    scene = _scene_with_frame_timestamps([0, 1_000_000, 2_000_000])
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, [_light_row("7", 0, "RED")])
+
+    # Postcondition. No decay near clip end.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 3
+
+
+def test_should_hold_state_through_internal_gap_when_track_reobserved(monkeypatch):
+    # Precondition. An 8s observation gap WITHIN the track (occlusion), not after it.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, "RED"), _light_row("7", 8_000_000, "RED")]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Interior frames stay held; no flicker to UNKNOWN.
+    assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 10
+
+
+def test_should_extend_trailing_hold_when_colocated_signal_corroborates(monkeypatch):
+    # Precondition. A co-located signal witnesses the same color 20s later.
+    scene = _scene_with_frame_timestamps([i * 2_000_000 for i in range(11)])
+    near = {"x": 1.0, "y": 2.5, "z": 3.0}
+    rows = [_light_row("7", 0, "RED"), _light_row("8", 20_000_000, "RED", center=near)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Corroborated: the 20s trailing hold keeps the color end to end.
+    early = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_7")
+    assert early.metadata["state_sequence"] == ["RED"] * 11
+
+
+def test_should_cut_trailing_hold_when_colocated_signal_contradicts(monkeypatch):
+    # Precondition. A co-located signal witnesses a DIFFERENT color 20s later.
+    scene = _scene_with_frame_timestamps([i * 2_000_000 for i in range(11)])
+    near = {"x": 1.0, "y": 2.5, "z": 3.0}
+    rows = [_light_row("7", 0, "RED"), _light_row("8", 20_000_000, "GREEN", center=near)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. The hold window keeps 2s of RED; the contradicted rest is UNKNOWN.
+    early = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_7")
+    assert early.metadata["state_sequence"] == ["RED"] * 2 + [None] * 9
+
+
+def test_should_not_use_far_signal_as_trailing_evidence(monkeypatch):
+    # Precondition. A same-color signal exists 100m away -- a different head.
+    scene = _scene_with_frame_timestamps([i * 2_000_000 for i in range(11)])
+    far = {"x": 101.0, "y": 2.0, "z": 3.0}
+    rows = [_light_row("7", 0, "RED"), _light_row("8", 20_000_000, "RED", center=far)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. No corroboration applied; the plain hold window governs.
+    early = next(li for li in scene.traffic_lights if li.element_id == "traffic_light_7")
+    assert early.metadata["state_sequence"] == ["RED"] * 2 + [None] * 9
