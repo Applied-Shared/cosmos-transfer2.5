@@ -90,6 +90,44 @@ _TL_MERGE_MAX_DISTANCE_M = 20.0
 _TL_MERGE_MAX_FACING_DEG = 45.0
 
 
+def _parse_traffic_light_box(light: Dict[str, Any]) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]:
+    """Parse one traffic-light row's box into the RDF world frame.
+
+    Returns ``(center, dimensions, orientation, orientation_known)``, or ``None``
+    when any component is NaN. Dimensions default to a 0.6 x 0.6 x 1.0 m head when
+    the column is absent or null (sim-bag-sourced lights record no extent).
+    Orientation is optional: a missing or null quaternion (e.g. signals from
+    sources that record no facing) defaults to identity, and
+    ``orientation_known`` is False so downstream consumers -- the renderer's
+    facing cull, the merge's facing agreement -- don't read the placeholder as a
+    real facing.
+    """
+    center = np.array(
+        [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
+        dtype=np.float32,
+    )
+
+    dimensions = np.array([0.6, 0.6, 1.0], dtype=np.float32)  # Default
+    if "dimensions" in light:
+        dims = light["dimensions"]
+        if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
+            dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
+
+    orient = light["orientation"] if "orientation" in light else None
+    orientation_known = orient is not None and all(orient[k] is not None for k in ("x", "y", "z", "w"))
+    if orientation_known:
+        orientation = np.array([orient["x"], orient["y"], orient["z"], orient["w"]], dtype=np.float32)
+    else:
+        orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
+        return None
+
+    center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
+    orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
+    return center, dimensions, orientation, orientation_known
+
+
 class _TrafficLightTrackFragment:
     """One signal track's timed-observation summary: the unit of merge detection."""
 
@@ -1322,44 +1360,16 @@ class ClipGTLoader(SceneDataLoader):
             group_id = str(label_id) if label_id is not None else f"row_{idx}"
             grouped[group_id].append((timestamp, light))
 
-        # Geometry is static per signal: parse it once per group, from the
-        # group's first observation.
+        # The group's first observation supplies the merge-detection center and
+        # the static fallback box; per-frame poses are built later, per light.
         geometry: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = {}
         fragments: List[_TrafficLightTrackFragment] = []
         for group_id, observations in grouped.items():
-            light = observations[0][1]
-
-            center = np.array(
-                [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
-                dtype=np.float32,
-            )
-
-            dimensions = np.array([0.6, 0.6, 1.0], dtype=np.float32)  # Default
-            if "dimensions" in light:
-                dims = light["dimensions"]
-                if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
-                    dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
-
-            # Orientation is optional: a missing or null quaternion (e.g. signals
-            # from sources that record no facing) defaults to identity. Record
-            # whether it was known so downstream consumers (e.g. the renderer's
-            # facing cull) don't treat the identity placeholder as a real facing.
-            orient = light["orientation"] if "orientation" in light else None
-            orientation_known = orient is not None and all(orient[k] is not None for k in ("x", "y", "z", "w"))
-            if orientation_known:
-                orientation = np.array(
-                    [orient["x"], orient["y"], orient["z"], orient["w"]],
-                    dtype=np.float32,
-                )
-            else:
-                orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-
-            if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
+            parsed = _parse_traffic_light_box(observations[0][1])
+            if parsed is None:
                 continue
-
-            center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
-            orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
-            geometry[group_id] = (center, dimensions, orientation, orientation_known)
+            center, dimensions, orientation, orientation_known = parsed
+            geometry[group_id] = parsed
 
             # Same facing convention as the renderer's cull: local +x axis.
             facing = Rotation.from_quat(orientation).apply([1.0, 0.0, 0.0]) if orientation_known else None
@@ -1402,11 +1412,18 @@ class ClipGTLoader(SceneDataLoader):
             observations = [obs for member_id in member_ids for obs in grouped[member_id]]
 
             center, dimensions, orientation, orientation_known = geometry[group_id]
+            # A head is stationary in the world, but the ego pose that placed it
+            # drifts, so freezing one row's box leaves it off the head on every
+            # other frame. Carry the per-frame boxes when the parquet has them.
+            poses = self._build_traffic_light_pose_sequence(observations, frame_timestamps)
             traffic_light = TrafficLight(
                 element_id=f"traffic_light_{group_id}",
                 center=center,
                 dimensions=dimensions,
                 orientation=orientation,
+                centers=None if poses is None else poses[0],
+                per_frame_dimensions=None if poses is None else poses[1],
+                orientations=None if poses is None else poses[2],
             )
             traffic_light.metadata["orientation_known"] = orientation_known
             if len(member_ids) > 1:
@@ -1454,6 +1471,51 @@ class ClipGTLoader(SceneDataLoader):
 
         _resolve_traffic_light_lead_ins(pending, frame_timestamps)
         _resolve_traffic_light_trailing_holds(pending, frame_timestamps)
+
+    @staticmethod
+    def _build_traffic_light_pose_sequence(
+        observations: List[Tuple[Optional[int], Dict[str, Any]]],
+        frame_timestamps: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Build per-frame ``(centers, dimensions, orientations)`` for one light.
+
+        ``observations`` are ``(timestamp_micros, light)`` tuples for one signal,
+        pooled across the signal's merged fragments. Timestamped rows with a
+        parseable box are mapped onto ``frame_timestamps`` by holding the most
+        recent box at or before each frame -- the same alignment
+        ``_build_traffic_light_state_sequence`` applies to state, so a frame's box
+        and its color come from the same observation whenever a row carries both
+        (the producer always writes them together). Frames before the first
+        observation take the first box.
+
+        Returns arrays of shape ``(F, 3)``, ``(F, 3)`` and ``(F, 4)`` for
+        ``F = len(frame_timestamps)``, or ``None`` when the signal has no
+        timestamped box to place per frame -- legacy one-row-per-signal parquets,
+        or a frame grid with nothing to align to -- leaving the caller on the
+        static pose.
+        """
+        if frame_timestamps is None or len(frame_timestamps) == 0:
+            return None
+
+        timed: List[Tuple[int, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]] = []
+        for timestamp, light in observations:
+            if timestamp is None or not isinstance(light, dict):
+                continue
+            parsed = _parse_traffic_light_box(light)
+            if parsed is not None:
+                timed.append((int(timestamp), parsed))
+        if not timed:
+            return None
+
+        timed.sort(key=lambda ts_box: ts_box[0])
+        observed_ts = np.array([ts for ts, _ in timed], dtype=np.int64)
+        centers = np.array([box[0] for _, box in timed], dtype=np.float32)
+        dimensions = np.array([box[1] for _, box in timed], dtype=np.float32)
+        orientations = np.array([box[2] for _, box in timed], dtype=np.float32)
+
+        indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
+        indices = np.clip(indices, 0, len(timed) - 1)
+        return centers[indices], dimensions[indices], orientations[indices]
 
     @staticmethod
     def _build_traffic_light_state_sequence(

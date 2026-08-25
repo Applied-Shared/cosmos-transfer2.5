@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario import data_types
-from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders import clipgt_loader
+from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders import clipgt_loader, data_utils
 
 _CENTER = {"x": 1.0, "y": 2.0, "z": 3.0}
 _IDENTITY = {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
@@ -497,3 +497,79 @@ def test_should_merge_colocated_disjoint_tracks_when_gap_within_window(monkeypat
     # Postcondition. One light, one uninterrupted color.
     assert len(scene.traffic_lights) == 1
     assert scene.traffic_lights[0].metadata["state_sequence"] == ["RED"] * 10
+
+
+def test_should_carry_per_frame_pose_when_rows_are_timestamped(monkeypatch):
+    # Precondition. One signal whose box moves in the parquet between frames --
+    # in real data this is the drifting ego pose that placed it, not the head.
+    scene = _scene_with_frame_timestamps([0, 10, 20])
+    rows = [
+        _light_row("7", 0, "RED", center={"x": 50.0, "y": 0.0, "z": 3.0}),
+        _light_row("7", 20, "RED", center={"x": 51.0, "y": 0.0, "z": 3.0}),
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Hold-last, one pose per frame: the t=0 box until t=20.
+    light = scene.traffic_lights[0]
+    expected = data_utils.convert_points_flu_to_rdf(
+        np.array([[50.0, 0.0, 3.0], [50.0, 0.0, 3.0], [51.0, 0.0, 3.0]], dtype=np.float32)
+    )
+    assert light.num_pose_frames == 3
+    np.testing.assert_allclose(light.centers, expected)
+
+
+def test_should_hold_first_pose_for_frames_before_first_observation(monkeypatch):
+    # Precondition. First observation at t=15, after frames at 0 and 10.
+    scene = _scene_with_frame_timestamps([0, 10, 20])
+    rows = [
+        _light_row("7", 15, "RED", center={"x": 50.0, "y": 0.0, "z": 3.0}),
+        _light_row("7", 18, "RED", center={"x": 52.0, "y": 0.0, "z": 3.0}),
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Leading frames clamp to the earliest box, as state does.
+    expected = data_utils.convert_points_flu_to_rdf(
+        np.array([[50.0, 0.0, 3.0], [50.0, 0.0, 3.0], [52.0, 0.0, 3.0]], dtype=np.float32)
+    )
+    np.testing.assert_allclose(scene.traffic_lights[0].centers, expected)
+
+
+def test_should_leave_pose_static_when_rows_carry_no_timestamp(monkeypatch):
+    # Precondition. Legacy shape: one untimed row per signal, nothing to place
+    # per frame.
+    scene = _scene_with_frame_timestamps([0, 10, 20])
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, [_light_row("7", None, "RED")])
+
+    # Postcondition. The renderer falls back to the single static box.
+    light = scene.traffic_lights[0]
+    assert light.num_pose_frames == 0
+    assert light.centers is None
+
+
+def test_should_take_each_frames_pose_from_the_member_that_saw_it(monkeypatch):
+    # Precondition. Two co-located fragments of one head, 3s apart, each
+    # reporting the box from its own frames. They merge into one light.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", i * 1_000_000, "RED", center=_NEAR) for i in range(2)]
+    rows += [_light_row("8", (4 + i) * 1_000_000, "RED", center=_NEAR_COLOCATED) for i in range(6)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Frames 0-3 hold fragment 7's box (frames 2-3 across the
+    # unwitnessed seam); frames 4-9 take fragment 8's.
+    assert len(scene.traffic_lights) == 1
+    expected = data_utils.convert_points_flu_to_rdf(
+        np.array(
+            [[_NEAR["x"], _NEAR["y"], _NEAR["z"]]] * 4
+            + [[_NEAR_COLOCATED["x"], _NEAR_COLOCATED["y"], _NEAR_COLOCATED["z"]]] * 6,
+            dtype=np.float32,
+        )
+    )
+    np.testing.assert_allclose(scene.traffic_lights[0].centers, expected)
