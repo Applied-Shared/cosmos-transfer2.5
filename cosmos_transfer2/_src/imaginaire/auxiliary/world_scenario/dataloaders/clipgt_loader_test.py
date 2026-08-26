@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario import data_types
 from cosmos_transfer2._src.imaginaire.auxiliary.world_scenario.dataloaders import clipgt_loader, data_utils
@@ -573,3 +574,78 @@ def test_should_take_each_frames_pose_from_the_member_that_saw_it(monkeypatch):
         )
     )
     np.testing.assert_allclose(scene.traffic_lights[0].centers, expected)
+
+
+def test_should_refresh_the_pose_but_hold_the_colour_across_stateless_rows(monkeypatch):
+    # Precondition. The head is detected on all three frames but its bulb is
+    # readable only on the first, so the later rows carry a pose and a null state.
+    scene = _scene_with_frame_timestamps([0, 10, 20])
+    rows = [
+        _light_row("7", 0, "RED", center={"x": 50.0, "y": 0.0, "z": 3.0}),
+        _light_row("7", 10, None, center={"x": 51.0, "y": 0.0, "z": 3.0}),
+        _light_row("7", 20, None, center={"x": 52.0, "y": 0.0, "z": 3.0}),
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. Every frame takes its own box, while the colour holds from
+    # the one frame that witnessed it: a stateless row moves the box without
+    # claiming a colour.
+    light = scene.traffic_lights[0]
+    expected = data_utils.convert_points_flu_to_rdf(
+        np.array([[50.0, 0.0, 3.0], [51.0, 0.0, 3.0], [52.0, 0.0, 3.0]], dtype=np.float32)
+    )
+    np.testing.assert_allclose(light.centers, expected)
+    assert light.metadata["state_sequence"] == ["RED"] * 3
+
+
+def test_should_anchor_merge_geometry_at_the_first_coloured_row(monkeypatch):
+    # Precondition. Fragment 7 opens with an unreadable-bulb frame whose box
+    # landed ~9 degrees off the bearing its coloured frames report; fragment 8
+    # re-acquires the same head 3s after 7's last colour.
+    scene = _scene_with_frame_timestamps([i * 1_000_000 for i in range(10)])
+    rows = [_light_row("7", 0, None, center=_NEAR_OFF_RAY)]
+    rows += [_light_row("7", (1 + i) * 1_000_000, "RED", center=_NEAR) for i in range(2)]
+    rows += [_light_row("8", (5 + i) * 1_000_000, "GREEN", center=_NEAR_COLOCATED) for i in range(5)]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. One head. Merge compared 7 at its earliest *coloured* box;
+    # anchoring on the stateless row would have put it off 8's bearing and split
+    # one head into two co-located lights with conflicting colours.
+    assert len(scene.traffic_lights) == 1
+    assert scene.traffic_lights[0].metadata["merged_track_ids"] == ["7", "8"]
+
+
+def test_should_flag_orientation_known_per_frame(monkeypatch):
+    # Precondition. One signal whose facing is recorded on the second frame only;
+    # the first row's null quaternion parses to an identity placeholder.
+    scene = _scene_with_frame_timestamps([0, 10])
+    rows = [
+        {"traffic_light": {"center": _CENTER, "orientation": None, "state": "RED"}, "key": _key("7", 0)},
+        _light_row("7", 10, "RED", orientation=_YAW_90),
+    ]
+
+    # Under test.
+    _load_keyed(monkeypatch, scene, rows)
+
+    # Postcondition. The flag follows the pose per frame, so the facing cull does
+    # not read frame 0's placeholder as a real lens normal.
+    np.testing.assert_array_equal(scene.traffic_lights[0].orientations_known, [False, True])
+
+
+def test_should_reject_an_empty_per_frame_pose():
+    # Precondition. Zero-length pose arrays are internally consistent but would
+    # leave num_pose_frames reporting "static" while the accessors index nothing.
+    empty = np.zeros((0, 3), dtype=np.float32)
+
+    # Under test / postcondition.
+    with pytest.raises(ValueError, match="at least one frame"):
+        data_types.TrafficLight(
+            element_id="traffic_light_7",
+            centers=empty,
+            per_frame_dimensions=empty,
+            orientations=np.zeros((0, 4), dtype=np.float32),
+        )

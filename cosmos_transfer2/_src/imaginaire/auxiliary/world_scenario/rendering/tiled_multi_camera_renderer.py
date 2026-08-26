@@ -276,17 +276,19 @@ class TiledMultiCameraRenderer:
         Geometry is precomputed per (head, frame): a head is stationary, but the
         ego pose that placed it drifts, so a box frozen at one frame's pose sits
         off the head on every other frame. A head carrying only a static pose
-        broadcasts to the same view on every frame, at no extra memory.
+        broadcasts its cuboid across the frames rather than copying it, which is
+        where the memory is (F x 24 vertices per head); the cull's centers and
+        normals below are materialized either way, at a few KB per head.
         """
 
         # Per-head, per-frame geometry for the per-camera facing cull (see
         # _project_traffic_lights): head center and lit-lens view-normal in the RDF
-        # world frame (local +x is the lens normal), plus whether the head's
-        # orientation is known -- an unknown orientation has no meaningful normal, so
-        # such heads are never culled.
+        # world frame (local +x is the lens normal), plus whether that frame's
+        # orientation is known -- an unknown orientation is an identity placeholder
+        # with no meaningful normal, so those frames are never culled.
         self._tl_centers: List[np.ndarray] = []
         self._tl_normals: List[np.ndarray] = []
-        self._tl_orientation_known: List[bool] = []
+        self._tl_orientation_known: List[np.ndarray] = []
 
         if not self.scene_data.traffic_lights:
             return [], None
@@ -303,7 +305,12 @@ class TiledMultiCameraRenderer:
 
             self._tl_centers.append(np.ascontiguousarray(transforms[:, :3, 3], dtype=np.float64))
             self._tl_normals.append(transforms[:, :3, :3].astype(np.float64) @ np.array([1.0, 0.0, 0.0]))
-            self._tl_orientation_known.append(bool(light.metadata.get("orientation_known", True)))
+            known = light.orientations_known
+            self._tl_orientation_known.append(
+                np.full(num_frames, bool(light.metadata.get("orientation_known", True)))
+                if known is None
+                else np.asarray(known, dtype=bool)
+            )
 
             status_dict[str(idx)] = {"state": sequence}
 
@@ -383,11 +390,11 @@ class TiledMultiCameraRenderer:
 
         # Per-camera facing cull: drop heads whose lit lens points away from this
         # camera (it would image only their dark housing back); keep heads whose
-        # orientation is unknown. None means the cull is disabled.
+        # orientation on this frame is unknown. None means the cull is disabled.
         facing_ok = compute_traffic_light_facing_mask(
             [centers[frame_id] for centers in self._tl_centers],
             [normals[frame_id] for normals in self._tl_normals],
-            self._tl_orientation_known,
+            [known[frame_id] for known in self._tl_orientation_known],
             np.asarray(camera_pose, dtype=np.float64)[:3, 3],
             TRAFFIC_LIGHT_FACING_CULL_DEG,
         )

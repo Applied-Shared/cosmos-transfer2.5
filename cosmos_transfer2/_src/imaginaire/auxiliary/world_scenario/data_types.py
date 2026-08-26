@@ -272,6 +272,11 @@ class TrafficLight(OrientedBoxElement):
     centers: Optional[NDArray[np.float32]] = None  # Shape: (N, 3)
     per_frame_dimensions: Optional[NDArray[np.float32]] = None  # Shape: (N, 3)
     orientations: Optional[NDArray[np.float32]] = None  # Shape: (N, 4)
+    # Per-frame counterpart of the metadata "orientation_known" flag: False where
+    # that frame's row recorded no facing and ``orientations`` holds an identity
+    # placeholder, so the renderer's facing cull does not read it as a real lens
+    # normal. None falls back to the single static flag.
+    orientations_known: Optional[NDArray[np.bool_]] = None  # Shape: (N,)
 
     def __post_init__(self) -> None:
         """Validate the static box and, when present, the per-frame pose."""
@@ -279,6 +284,11 @@ class TrafficLight(OrientedBoxElement):
         if self.centers is None:
             return
         num_frames = len(self.centers)
+        if num_frames == 0:
+            # An empty pose array is self-consistent but would leave
+            # num_pose_frames reporting "static" while the accessors index into
+            # nothing; pass None for a light that has only its static box.
+            raise ValueError("Per-frame poses must cover at least one frame; pass None for a static box")
         if self.centers.shape != (num_frames, 3):
             raise ValueError(f"Per-frame centers must have shape (N, 3), got {self.centers.shape}")
         if self.orientations is None or self.orientations.shape != (num_frames, 4):
@@ -287,6 +297,10 @@ class TrafficLight(OrientedBoxElement):
         if self.per_frame_dimensions is None or self.per_frame_dimensions.shape != (num_frames, 3):
             shape = None if self.per_frame_dimensions is None else self.per_frame_dimensions.shape
             raise ValueError(f"Per-frame dimensions must have shape ({num_frames}, 3), got {shape}")
+        if self.orientations_known is not None and self.orientations_known.shape != (num_frames,):
+            raise ValueError(
+                f"Per-frame orientation flags must have shape ({num_frames},), got {self.orientations_known.shape}"
+            )
 
     @property
     def num_pose_frames(self) -> int:

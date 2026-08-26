@@ -128,6 +128,56 @@ def _parse_traffic_light_box(light: Dict[str, Any]) -> Optional[Tuple[np.ndarray
     return center, dimensions, orientation, orientation_known
 
 
+def _usable_traffic_light_state(light: Any) -> Optional[str]:
+    """The row's signal color, or ``None`` when it carries no readable one.
+
+    A frame whose bulb the labeler could not read is written with a null state:
+    the row exists to carry that frame's pose and must not be read as a color.
+    """
+    state = light.get("state") if isinstance(light, dict) else None
+    return state if isinstance(state, str) and state.strip() else None
+
+
+def _first_colored_traffic_light_box(
+    observations: List[Tuple[Optional[int], Dict[str, Any]]],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]:
+    """The group's earliest box that also carries a readable color.
+
+    Rows are written in timestamp order, so this is the fragment's earliest
+    colored sighting -- the point merge detection compares fragments at (see the
+    merge-geometry note in ``_load_traffic_lights``). It has to be a *colored*
+    row rather than simply the first: the producer also writes rows for frames
+    whose bulb was unreadable, and a fragment's span (``t_first``/``t_last``) is
+    measured over colored rows only, so the first row of any kind would place
+    the comparison center at a different point in the fragment's drift history
+    than its span. Falls back to the earliest parseable row for a group with no
+    colored row at all (legacy parquets; the producer drops such heads).
+    """
+    fallback: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = None
+    for _, light in observations:
+        parsed = _parse_traffic_light_box(light)
+        if parsed is None:
+            continue
+        if _usable_traffic_light_state(light) is not None:
+            return parsed
+        if fallback is None:
+            fallback = parsed
+    return fallback
+
+
+def _hold_last_indices(observed_ts: np.ndarray, frame_timestamps: np.ndarray) -> np.ndarray:
+    """Index of the most recent observation at or before each frame.
+
+    ``observed_ts`` must be sorted ascending. Frames before the first observation
+    clamp to index 0, so a caller that treats those as guesses rather than
+    observations has to bound them itself. Pose and state alignment share this
+    one rule so a frame's box and its color are always picked the same way;
+    changing the rule changes both together.
+    """
+    indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
+    return np.clip(indices, 0, len(observed_ts) - 1)
+
+
 class _TrafficLightTrackFragment:
     """One signal track's timed-observation summary: the unit of merge detection."""
 
@@ -1361,22 +1411,22 @@ class ClipGTLoader(SceneDataLoader):
             grouped[group_id].append((timestamp, light))
 
         # Merge detection compares fragments at one pose each, taken from the
-        # group's first row -- its earliest sighting, as rows are written in
-        # timestamp order. It has to stay the earliest: a head's recorded world
-        # position is ego pose + measured offset, and the ego pose drifts, so a
-        # stationary head's recorded position creeps meters over its lifetime.
-        # Rendering is immune (a frame's box and that frame's camera carry the
-        # same drift, which cancels in projection) but a distance between two
-        # fragments has nothing to cancel it, so fragments are only comparable
-        # at the same point in their drift histories -- comparing a young
-        # fragment against an old one measures accumulated drift rather than
-        # separation, and leaves one head split into two co-located lights with
-        # conflicting colors. The same row supplies the static fallback box;
-        # per-frame poses are built below, per light.
+        # group's earliest colored row (``_first_colored_traffic_light_box``).
+        # It has to stay the earliest: a head's recorded world position is ego
+        # pose + measured offset, and the ego pose drifts, so a stationary head's
+        # recorded position creeps meters over its lifetime. Rendering is immune
+        # (a frame's box and that frame's camera carry the same drift, which
+        # cancels in projection) but a distance between two fragments has nothing
+        # to cancel it, so fragments are only comparable at the same point in
+        # their drift histories -- comparing a young fragment against an old one
+        # measures accumulated drift rather than separation, and leaves one head
+        # split into two co-located lights with conflicting colors. The same row
+        # supplies the static fallback box; per-frame poses are built below, per
+        # light.
         geometry: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = {}
         fragments: List[_TrafficLightTrackFragment] = []
         for group_id, observations in grouped.items():
-            parsed = _parse_traffic_light_box(observations[0][1])
+            parsed = _first_colored_traffic_light_box(observations)
             if parsed is None:
                 continue
             center, dimensions, orientation, orientation_known = parsed
@@ -1384,11 +1434,12 @@ class ClipGTLoader(SceneDataLoader):
 
             # Same facing convention as the renderer's cull: local +x axis.
             facing = Rotation.from_quat(orientation).apply([1.0, 0.0, 0.0]) if orientation_known else None
-            timed = sorted(
-                (int(ts), obs.get("state"))
-                for ts, obs in observations
-                if ts is not None and isinstance(obs.get("state"), str) and obs.get("state").strip()
-            )
+            timed: List[Tuple[int, str]] = []
+            for ts, obs in observations:
+                obs_state = _usable_traffic_light_state(obs)
+                if ts is not None and obs_state is not None:
+                    timed.append((int(ts), obs_state))
+            timed.sort()
             if timed:
                 fragments.append(
                     _TrafficLightTrackFragment(
@@ -1435,7 +1486,9 @@ class ClipGTLoader(SceneDataLoader):
                 centers=None if poses is None else poses[0],
                 per_frame_dimensions=None if poses is None else poses[1],
                 orientations=None if poses is None else poses[2],
+                orientations_known=None if poses is None else poses[3],
             )
+            # Static fallback flag, for a light with no per-frame poses.
             traffic_light.metadata["orientation_known"] = orientation_known
             if len(member_ids) > 1:
                 traffic_light.metadata["merged_track_ids"] = member_ids
@@ -1487,23 +1540,40 @@ class ClipGTLoader(SceneDataLoader):
     def _build_traffic_light_pose_sequence(
         observations: List[Tuple[Optional[int], Dict[str, Any]]],
         frame_timestamps: np.ndarray,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Build per-frame ``(centers, dimensions, orientations)`` for one light.
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Per-frame ``(centers, dimensions, orientations, orientations_known)``.
 
         ``observations`` are ``(timestamp_micros, light)`` tuples for one signal,
         pooled across the signal's merged fragments. Timestamped rows with a
-        parseable box are mapped onto ``frame_timestamps`` by holding the most
-        recent box at or before each frame -- the same alignment
-        ``_build_traffic_light_state_sequence`` applies to state, so a frame's box
-        and its color come from the same observation whenever a row carries both
-        (the producer always writes them together). Frames before the first
-        observation take the first box.
+        parseable box are mapped onto ``frame_timestamps`` by ``_hold_last_indices``
+        -- the same alignment ``_build_traffic_light_state_sequence`` applies to
+        state, so a frame's box and its color come from the same observation
+        whenever one row carries both.
 
-        Returns arrays of shape ``(F, 3)``, ``(F, 3)`` and ``(F, 4)`` for
-        ``F = len(frame_timestamps)``, or ``None`` when the signal has no
-        timestamped box to place per frame -- legacy one-row-per-signal parquets,
-        or a frame grid with nothing to align to -- leaving the caller on the
-        static pose.
+        The two do hold over different subsets of the rows, deliberately: a frame
+        whose bulb was unreadable is written with a real pose and a null state, so
+        each stream holds the most recent row carrying *its own* field. A
+        stateless row refreshes the box without claiming a color, and a row whose
+        box is unparseable refreshes the color without moving the box.
+
+        Both directions of the pose hold are unbounded, unlike state's
+        ``_TL_STATE_HOLD_MAX_MICROS`` cap. An unwitnessed color is a guess that
+        can be flatly wrong, since the phase may have changed; an unwitnessed pose
+        is the best available estimate for a box the renderer keeps drawing
+        anyway, and withholding it would only put the box somewhere worse. So a
+        head whose track dies while the ego is still approaching keeps its
+        death-frame pose for the rest of the clip, off by the drift accumulated
+        since -- the same error this scheme removes inside the observed span, and
+        strictly less of it than a single pose frozen across the whole clip.
+
+        ``orientations_known`` is the per-frame counterpart of
+        ``_parse_traffic_light_box``'s flag: a row with no recorded facing gets an
+        identity placeholder, which the facing cull must not read as a real lens
+        normal. Returns arrays of shape ``(F, 3)``, ``(F, 3)``, ``(F, 4)`` and
+        ``(F,)`` for ``F = len(frame_timestamps)``, or ``None`` when the signal has
+        no timestamped box to place per frame -- legacy one-row-per-signal
+        parquets, or a frame grid with nothing to align to -- leaving the caller
+        on the static pose.
         """
         if frame_timestamps is None or len(frame_timestamps) == 0:
             return None
@@ -1523,10 +1593,15 @@ class ClipGTLoader(SceneDataLoader):
         centers = np.array([box[0] for _, box in timed], dtype=np.float32)
         dimensions = np.array([box[1] for _, box in timed], dtype=np.float32)
         orientations = np.array([box[2] for _, box in timed], dtype=np.float32)
+        orientations_known = np.array([box[3] for _, box in timed], dtype=bool)
 
-        indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
-        indices = np.clip(indices, 0, len(timed) - 1)
-        return centers[indices], dimensions[indices], orientations[indices]
+        indices = _hold_last_indices(observed_ts, frame_timestamps)
+        return (
+            centers[indices],
+            dimensions[indices],
+            orientations[indices],
+            orientations_known[indices],
+        )
 
     @staticmethod
     def _build_traffic_light_state_sequence(
@@ -1554,8 +1629,8 @@ class ClipGTLoader(SceneDataLoader):
         timed: List[Tuple[int, str]] = []
         untimed_state: Optional[str] = None
         for timestamp, light in observations:
-            state = light.get("state") if isinstance(light, dict) else None
-            if not (isinstance(state, str) and state.strip()):
+            state = _usable_traffic_light_state(light)
+            if state is None:
                 continue
             if timestamp is None:
                 untimed_state = state
@@ -1571,8 +1646,7 @@ class ClipGTLoader(SceneDataLoader):
                 return [observed_states[0]] * num_frames, 0, num_frames, None
             # Most recent observation at or before each frame; frames before the
             # first observation provisionally take the first state.
-            indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
-            indices = np.clip(indices, 0, len(observed_states) - 1)
+            indices = _hold_last_indices(observed_ts, frame_timestamps)
             first_observed_frame = int(np.searchsorted(frame_timestamps, observed_ts[0], side="left"))
             last_observed_end = int(np.searchsorted(frame_timestamps, observed_ts[-1], side="right"))
             return [observed_states[int(i)] for i in indices], first_observed_frame, last_observed_end, int(observed_ts[-1])
