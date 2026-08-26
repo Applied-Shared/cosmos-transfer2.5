@@ -1360,8 +1360,19 @@ class ClipGTLoader(SceneDataLoader):
             group_id = str(label_id) if label_id is not None else f"row_{idx}"
             grouped[group_id].append((timestamp, light))
 
-        # The group's first observation supplies the merge-detection center and
-        # the static fallback box; per-frame poses are built later, per light.
+        # Merge detection compares fragments at one pose each, taken from the
+        # group's first row -- its earliest sighting, as rows are written in
+        # timestamp order. It has to stay the earliest: a head's recorded world
+        # position is ego pose + measured offset, and the ego pose drifts, so a
+        # stationary head's recorded position creeps meters over its lifetime.
+        # Rendering is immune (a frame's box and that frame's camera carry the
+        # same drift, which cancels in projection) but a distance between two
+        # fragments has nothing to cancel it, so fragments are only comparable
+        # at the same point in their drift histories -- comparing a young
+        # fragment against an old one measures accumulated drift rather than
+        # separation, and leaves one head split into two co-located lights with
+        # conflicting colors. The same row supplies the static fallback box;
+        # per-frame poses are built below, per light.
         geometry: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = {}
         fragments: List[_TrafficLightTrackFragment] = []
         for group_id, observations in grouped.items():
