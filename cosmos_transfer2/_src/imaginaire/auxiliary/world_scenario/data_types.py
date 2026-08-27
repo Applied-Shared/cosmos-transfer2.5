@@ -262,6 +262,66 @@ class TrafficLight(OrientedBoxElement):
 
     states: Dict[int, TrafficLightState] = field(default_factory=dict)  # frame_id -> state
 
+    # Optional per-frame pose, one entry per render frame. A head does not move,
+    # but the ego pose that placed it drifts over a clip, so a box frozen at one
+    # frame's pose sits off the head on every other frame. Placing the box from
+    # the frame's own pose puts the same ego pose on both sides of the
+    # projection, where it cancels -- the mechanism that already keeps
+    # DynamicObject boxes on their objects. None falls back to the static
+    # center/dimensions/orientation above (legacy one-row-per-signal parquets).
+    centers: Optional[NDArray[np.float32]] = None  # Shape: (N, 3)
+    per_frame_dimensions: Optional[NDArray[np.float32]] = None  # Shape: (N, 3)
+    orientations: Optional[NDArray[np.float32]] = None  # Shape: (N, 4)
+    # Per-frame counterpart of the metadata "orientation_known" flag: False where
+    # that frame's row recorded no facing and ``orientations`` holds an identity
+    # placeholder, so the renderer's facing cull does not read it as a real lens
+    # normal. None falls back to the single static flag.
+    orientations_known: Optional[NDArray[np.bool_]] = None  # Shape: (N,)
+
+    def __post_init__(self) -> None:
+        """Validate the static box and, when present, the per-frame pose."""
+        super().__post_init__()
+        if self.centers is None:
+            return
+        num_frames = len(self.centers)
+        if num_frames == 0:
+            # An empty pose array is self-consistent but would leave
+            # num_pose_frames reporting "static" while the accessors index into
+            # nothing; pass None for a light that has only its static box.
+            raise ValueError("Per-frame poses must cover at least one frame; pass None for a static box")
+        if self.centers.shape != (num_frames, 3):
+            raise ValueError(f"Per-frame centers must have shape (N, 3), got {self.centers.shape}")
+        if self.orientations is None or self.orientations.shape != (num_frames, 4):
+            shape = None if self.orientations is None else self.orientations.shape
+            raise ValueError(f"Per-frame orientations must have shape ({num_frames}, 4), got {shape}")
+        if self.per_frame_dimensions is None or self.per_frame_dimensions.shape != (num_frames, 3):
+            shape = None if self.per_frame_dimensions is None else self.per_frame_dimensions.shape
+            raise ValueError(f"Per-frame dimensions must have shape ({num_frames}, 3), got {shape}")
+        if self.orientations_known is not None and self.orientations_known.shape != (num_frames,):
+            raise ValueError(
+                f"Per-frame orientation flags must have shape ({num_frames},), got {self.orientations_known.shape}"
+            )
+
+    @property
+    def num_pose_frames(self) -> int:
+        """Number of per-frame poses, 0 when only the static pose is available."""
+        return 0 if self.centers is None else len(self.centers)
+
+    def transformation_matrix_at(self, frame_id: int) -> NDArray[np.float32]:
+        """4x4 transform for ``frame_id``, falling back to the static pose."""
+        if self.centers is None:
+            return self.transformation_matrix
+        matrix = np.eye(4, dtype=np.float32)
+        matrix[:3, 3] = self.centers[frame_id]
+        matrix[:3, :3] = Rotation.from_quat(self.orientations[frame_id]).as_matrix()
+        return matrix
+
+    def dimensions_at(self, frame_id: int) -> NDArray[np.float32]:
+        """Box dimensions for ``frame_id``, falling back to the static ones."""
+        if self.per_frame_dimensions is None:
+            return self.dimensions
+        return self.per_frame_dimensions[frame_id]
+
     def get_state(self, frame_id: int) -> TrafficLightState:
         """Get traffic light state for a given frame."""
         return self.states.get(frame_id, TrafficLightState.UNKNOWN)

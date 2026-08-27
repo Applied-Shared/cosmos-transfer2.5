@@ -90,6 +90,94 @@ _TL_MERGE_MAX_DISTANCE_M = 20.0
 _TL_MERGE_MAX_FACING_DEG = 45.0
 
 
+def _parse_traffic_light_box(light: Dict[str, Any]) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]:
+    """Parse one traffic-light row's box into the RDF world frame.
+
+    Returns ``(center, dimensions, orientation, orientation_known)``, or ``None``
+    when any component is NaN. Dimensions default to a 0.6 x 0.6 x 1.0 m head when
+    the column is absent or null (sim-bag-sourced lights record no extent).
+    Orientation is optional: a missing or null quaternion (e.g. signals from
+    sources that record no facing) defaults to identity, and
+    ``orientation_known`` is False so downstream consumers -- the renderer's
+    facing cull, the merge's facing agreement -- don't read the placeholder as a
+    real facing.
+    """
+    center = np.array(
+        [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
+        dtype=np.float32,
+    )
+
+    dimensions = np.array([0.6, 0.6, 1.0], dtype=np.float32)  # Default
+    if "dimensions" in light:
+        dims = light["dimensions"]
+        if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
+            dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
+
+    orient = light["orientation"] if "orientation" in light else None
+    orientation_known = orient is not None and all(orient[k] is not None for k in ("x", "y", "z", "w"))
+    if orientation_known:
+        orientation = np.array([orient["x"], orient["y"], orient["z"], orient["w"]], dtype=np.float32)
+    else:
+        orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
+        return None
+
+    center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
+    orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
+    return center, dimensions, orientation, orientation_known
+
+
+def _usable_traffic_light_state(light: Any) -> Optional[str]:
+    """The row's signal color, or ``None`` when it carries no readable one.
+
+    A frame whose bulb the labeler could not read is written with a null state:
+    the row exists to carry that frame's pose and must not be read as a color.
+    """
+    state = light.get("state") if isinstance(light, dict) else None
+    return state if isinstance(state, str) and state.strip() else None
+
+
+def _first_colored_traffic_light_box(
+    observations: List[Tuple[Optional[int], Dict[str, Any]]],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]:
+    """The group's earliest box that also carries a readable color.
+
+    Rows are written in timestamp order, so this is the fragment's earliest
+    colored sighting -- the point merge detection compares fragments at (see the
+    merge-geometry note in ``_load_traffic_lights``). It has to be a *colored*
+    row rather than simply the first: the producer also writes rows for frames
+    whose bulb was unreadable, and a fragment's span (``t_first``/``t_last``) is
+    measured over colored rows only, so the first row of any kind would place
+    the comparison center at a different point in the fragment's drift history
+    than its span. Falls back to the earliest parseable row for a group with no
+    colored row at all (legacy parquets; the producer drops such heads).
+    """
+    fallback: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = None
+    for _, light in observations:
+        parsed = _parse_traffic_light_box(light)
+        if parsed is None:
+            continue
+        if _usable_traffic_light_state(light) is not None:
+            return parsed
+        if fallback is None:
+            fallback = parsed
+    return fallback
+
+
+def _hold_last_indices(observed_ts: np.ndarray, frame_timestamps: np.ndarray) -> np.ndarray:
+    """Index of the most recent observation at or before each frame.
+
+    ``observed_ts`` must be sorted ascending. Frames before the first observation
+    clamp to index 0, so a caller that treats those as guesses rather than
+    observations has to bound them itself. Pose and state alignment share this
+    one rule so a frame's box and its color are always picked the same way;
+    changing the rule changes both together.
+    """
+    indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
+    return np.clip(indices, 0, len(observed_ts) - 1)
+
+
 class _TrafficLightTrackFragment:
     """One signal track's timed-observation summary: the unit of merge detection."""
 
@@ -1322,52 +1410,36 @@ class ClipGTLoader(SceneDataLoader):
             group_id = str(label_id) if label_id is not None else f"row_{idx}"
             grouped[group_id].append((timestamp, light))
 
-        # Geometry is static per signal: parse it once per group, from the
-        # group's first observation.
+        # Merge detection compares fragments at one pose each, taken from the
+        # group's earliest colored row (``_first_colored_traffic_light_box``).
+        # It has to stay the earliest: a head's recorded world position is ego
+        # pose + measured offset, and the ego pose drifts, so a stationary head's
+        # recorded position creeps meters over its lifetime. Rendering is immune
+        # (a frame's box and that frame's camera carry the same drift, which
+        # cancels in projection) but a distance between two fragments has nothing
+        # to cancel it, so fragments are only comparable at the same point in
+        # their drift histories -- comparing a young fragment against an old one
+        # measures accumulated drift rather than separation, and leaves one head
+        # split into two co-located lights with conflicting colors. The same row
+        # supplies the static fallback box; per-frame poses are built below, per
+        # light.
         geometry: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = {}
         fragments: List[_TrafficLightTrackFragment] = []
         for group_id, observations in grouped.items():
-            light = observations[0][1]
-
-            center = np.array(
-                [light["center"]["x"], light["center"]["y"], light["center"]["z"]],
-                dtype=np.float32,
-            )
-
-            dimensions = np.array([0.6, 0.6, 1.0], dtype=np.float32)  # Default
-            if "dimensions" in light:
-                dims = light["dimensions"]
-                if dims is not None and all(dims[k] is not None for k in ["x", "y", "z"]):
-                    dimensions = np.array([dims["x"], dims["y"], dims["z"]], dtype=np.float32)
-
-            # Orientation is optional: a missing or null quaternion (e.g. signals
-            # from sources that record no facing) defaults to identity. Record
-            # whether it was known so downstream consumers (e.g. the renderer's
-            # facing cull) don't treat the identity placeholder as a real facing.
-            orient = light["orientation"] if "orientation" in light else None
-            orientation_known = orient is not None and all(orient[k] is not None for k in ("x", "y", "z", "w"))
-            if orientation_known:
-                orientation = np.array(
-                    [orient["x"], orient["y"], orient["z"], orient["w"]],
-                    dtype=np.float32,
-                )
-            else:
-                orientation = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-
-            if np.isnan(center).any() or np.isnan(dimensions).any() or np.isnan(orientation).any():
+            parsed = _first_colored_traffic_light_box(observations)
+            if parsed is None:
                 continue
-
-            center = convert_points_flu_to_rdf(center.reshape(1, 3))[0]
-            orientation = convert_quaternions_flu_to_rdf(orientation.reshape(1, 4))[0]
-            geometry[group_id] = (center, dimensions, orientation, orientation_known)
+            center, dimensions, orientation, orientation_known = parsed
+            geometry[group_id] = parsed
 
             # Same facing convention as the renderer's cull: local +x axis.
             facing = Rotation.from_quat(orientation).apply([1.0, 0.0, 0.0]) if orientation_known else None
-            timed = sorted(
-                (int(ts), obs.get("state"))
-                for ts, obs in observations
-                if ts is not None and isinstance(obs.get("state"), str) and obs.get("state").strip()
-            )
+            timed: List[Tuple[int, str]] = []
+            for ts, obs in observations:
+                obs_state = _usable_traffic_light_state(obs)
+                if ts is not None and obs_state is not None:
+                    timed.append((int(ts), obs_state))
+            timed.sort()
             if timed:
                 fragments.append(
                     _TrafficLightTrackFragment(
@@ -1402,12 +1474,21 @@ class ClipGTLoader(SceneDataLoader):
             observations = [obs for member_id in member_ids for obs in grouped[member_id]]
 
             center, dimensions, orientation, orientation_known = geometry[group_id]
+            # A head is stationary in the world, but the ego pose that placed it
+            # drifts, so freezing one row's box leaves it off the head on every
+            # other frame. Carry the per-frame boxes when the parquet has them.
+            poses = self._build_traffic_light_pose_sequence(observations, frame_timestamps)
             traffic_light = TrafficLight(
                 element_id=f"traffic_light_{group_id}",
                 center=center,
                 dimensions=dimensions,
                 orientation=orientation,
+                centers=None if poses is None else poses[0],
+                per_frame_dimensions=None if poses is None else poses[1],
+                orientations=None if poses is None else poses[2],
+                orientations_known=None if poses is None else poses[3],
             )
+            # Static fallback flag, for a light with no per-frame poses.
             traffic_light.metadata["orientation_known"] = orientation_known
             if len(member_ids) > 1:
                 traffic_light.metadata["merged_track_ids"] = member_ids
@@ -1456,6 +1537,73 @@ class ClipGTLoader(SceneDataLoader):
         _resolve_traffic_light_trailing_holds(pending, frame_timestamps)
 
     @staticmethod
+    def _build_traffic_light_pose_sequence(
+        observations: List[Tuple[Optional[int], Dict[str, Any]]],
+        frame_timestamps: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Per-frame ``(centers, dimensions, orientations, orientations_known)``.
+
+        ``observations`` are ``(timestamp_micros, light)`` tuples for one signal,
+        pooled across the signal's merged fragments. Timestamped rows with a
+        parseable box are mapped onto ``frame_timestamps`` by ``_hold_last_indices``
+        -- the same alignment ``_build_traffic_light_state_sequence`` applies to
+        state, so a frame's box and its color come from the same observation
+        whenever one row carries both.
+
+        The two do hold over different subsets of the rows, deliberately: a frame
+        whose bulb was unreadable is written with a real pose and a null state, so
+        each stream holds the most recent row carrying *its own* field. A
+        stateless row refreshes the box without claiming a color, and a row whose
+        box is unparseable refreshes the color without moving the box.
+
+        Both directions of the pose hold are unbounded, unlike state's
+        ``_TL_STATE_HOLD_MAX_MICROS`` cap. An unwitnessed color is a guess that
+        can be flatly wrong, since the phase may have changed; an unwitnessed pose
+        is the best available estimate for a box the renderer keeps drawing
+        anyway, and withholding it would only put the box somewhere worse. So a
+        head whose track dies while the ego is still approaching keeps its
+        death-frame pose for the rest of the clip, off by the drift accumulated
+        since -- the same error this scheme removes inside the observed span, and
+        strictly less of it than a single pose frozen across the whole clip.
+
+        ``orientations_known`` is the per-frame counterpart of
+        ``_parse_traffic_light_box``'s flag: a row with no recorded facing gets an
+        identity placeholder, which the facing cull must not read as a real lens
+        normal. Returns arrays of shape ``(F, 3)``, ``(F, 3)``, ``(F, 4)`` and
+        ``(F,)`` for ``F = len(frame_timestamps)``, or ``None`` when the signal has
+        no timestamped box to place per frame -- legacy one-row-per-signal
+        parquets, or a frame grid with nothing to align to -- leaving the caller
+        on the static pose.
+        """
+        if frame_timestamps is None or len(frame_timestamps) == 0:
+            return None
+
+        timed: List[Tuple[int, Tuple[np.ndarray, np.ndarray, np.ndarray, bool]]] = []
+        for timestamp, light in observations:
+            if timestamp is None or not isinstance(light, dict):
+                continue
+            parsed = _parse_traffic_light_box(light)
+            if parsed is not None:
+                timed.append((int(timestamp), parsed))
+        if not timed:
+            return None
+
+        timed.sort(key=lambda ts_box: ts_box[0])
+        observed_ts = np.array([ts for ts, _ in timed], dtype=np.int64)
+        centers = np.array([box[0] for _, box in timed], dtype=np.float32)
+        dimensions = np.array([box[1] for _, box in timed], dtype=np.float32)
+        orientations = np.array([box[2] for _, box in timed], dtype=np.float32)
+        orientations_known = np.array([box[3] for _, box in timed], dtype=bool)
+
+        indices = _hold_last_indices(observed_ts, frame_timestamps)
+        return (
+            centers[indices],
+            dimensions[indices],
+            orientations[indices],
+            orientations_known[indices],
+        )
+
+    @staticmethod
     def _build_traffic_light_state_sequence(
         observations: List[Tuple[Optional[int], Dict[str, Any]]],
         frame_timestamps: np.ndarray,
@@ -1481,8 +1629,8 @@ class ClipGTLoader(SceneDataLoader):
         timed: List[Tuple[int, str]] = []
         untimed_state: Optional[str] = None
         for timestamp, light in observations:
-            state = light.get("state") if isinstance(light, dict) else None
-            if not (isinstance(state, str) and state.strip()):
+            state = _usable_traffic_light_state(light)
+            if state is None:
                 continue
             if timestamp is None:
                 untimed_state = state
@@ -1498,8 +1646,7 @@ class ClipGTLoader(SceneDataLoader):
                 return [observed_states[0]] * num_frames, 0, num_frames, None
             # Most recent observation at or before each frame; frames before the
             # first observation provisionally take the first state.
-            indices = np.searchsorted(observed_ts, frame_timestamps, side="right") - 1
-            indices = np.clip(indices, 0, len(observed_states) - 1)
+            indices = _hold_last_indices(observed_ts, frame_timestamps)
             first_observed_frame = int(np.searchsorted(frame_timestamps, observed_ts[0], side="left"))
             last_observed_end = int(np.searchsorted(frame_timestamps, observed_ts[-1], side="right"))
             return [observed_states[int(i)] for i in indices], first_observed_frame, last_observed_end, int(observed_ts[-1])

@@ -271,16 +271,24 @@ class TiledMultiCameraRenderer:
         self.edge_color = np.array([200, 200, 200]) / 255.0
 
     def _prepare_traffic_light_assets(self) -> Tuple[List[np.ndarray], Optional[Dict[str, Dict[str, List[str]]]]]:
-        """Precompute traffic light geometry and status sequences."""
+        """Precompute traffic light geometry and status sequences.
 
-        # Per-head geometry for the per-camera facing cull (see
+        Geometry is precomputed per (head, frame): a head is stationary, but the
+        ego pose that placed it drifts, so a box frozen at one frame's pose sits
+        off the head on every other frame. A head carrying only a static pose
+        broadcasts its cuboid across the frames rather than copying it, which is
+        where the memory is (F x 24 vertices per head); the cull's centers and
+        normals below are materialized either way, at a few KB per head.
+        """
+
+        # Per-head, per-frame geometry for the per-camera facing cull (see
         # _project_traffic_lights): head center and lit-lens view-normal in the RDF
-        # world frame (local +x is the lens normal), plus whether the head's
-        # orientation is known -- an unknown orientation has no meaningful normal, so
-        # such heads are never culled.
+        # world frame (local +x is the lens normal), plus whether that frame's
+        # orientation is known -- an unknown orientation is an identity placeholder
+        # with no meaningful normal, so those frames are never culled.
         self._tl_centers: List[np.ndarray] = []
         self._tl_normals: List[np.ndarray] = []
-        self._tl_orientation_known: List[bool] = []
+        self._tl_orientation_known: List[np.ndarray] = []
 
         if not self.scene_data.traffic_lights:
             return [], None
@@ -292,20 +300,53 @@ class TiledMultiCameraRenderer:
         for idx, light in enumerate(self.scene_data.traffic_lights):
             sequence = self._build_light_state_sequence(light, num_frames)
 
-            # Build cuboid polyline for rendering
-            dims = np.asarray(light.dimensions, dtype=np.float32)
-            transform = light.transformation_matrix
-            cuboid_vertices = build_cuboid_bounding_box(dims[0], dims[1], dims[2], transform)
-            polyline = cuboid3d_to_polyline(cuboid_vertices).astype(np.float32)
-            polylines.append(polyline)
+            frame_polylines, transforms = self._build_light_pose_frames(light, num_frames)
+            polylines.append(frame_polylines)
 
-            self._tl_centers.append(np.asarray(transform[:3, 3], dtype=np.float64))
-            self._tl_normals.append(np.asarray(transform[:3, :3], dtype=np.float64) @ np.array([1.0, 0.0, 0.0]))
-            self._tl_orientation_known.append(bool(light.metadata.get("orientation_known", True)))
+            self._tl_centers.append(np.ascontiguousarray(transforms[:, :3, 3], dtype=np.float64))
+            self._tl_normals.append(transforms[:, :3, :3].astype(np.float64) @ np.array([1.0, 0.0, 0.0]))
+            known = light.orientations_known
+            self._tl_orientation_known.append(
+                np.full(num_frames, bool(light.metadata.get("orientation_known", True)))
+                if known is None
+                else np.asarray(known, dtype=bool)
+            )
 
             status_dict[str(idx)] = {"state": sequence}
 
         return polylines, status_dict
+
+    @staticmethod
+    def _build_light_pose_frames(light: "TrafficLight", num_frames: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-frame cuboid polylines ``(F, V, 3)`` and transforms ``(F, 4, 4)``."""
+
+        if light.num_pose_frames == 0:
+            dims = np.asarray(light.dimensions, dtype=np.float32)
+            transform = light.transformation_matrix
+            polyline = cuboid3d_to_polyline(build_cuboid_bounding_box(dims[0], dims[1], dims[2], transform)).astype(
+                np.float32
+            )
+            return (
+                np.broadcast_to(polyline, (num_frames, *polyline.shape)),
+                np.broadcast_to(transform, (num_frames, 4, 4)),
+            )
+
+        if light.num_pose_frames != num_frames:
+            raise ValueError(
+                f"Traffic light {light.element_id} carries {light.num_pose_frames} poses "
+                f"but the scene has {num_frames} frames"
+            )
+
+        transforms = np.stack([light.transformation_matrix_at(frame) for frame in range(num_frames)])
+        frame_polylines = np.stack(
+            [
+                cuboid3d_to_polyline(build_cuboid_bounding_box(*light.dimensions_at(frame), transforms[frame])).astype(
+                    np.float32
+                )
+                for frame in range(num_frames)
+            ]
+        )
+        return frame_polylines, transforms
 
     def _build_light_state_sequence(self, light: "TrafficLight", num_frames: int) -> List[str]:
         """Construct per-frame state sequence for a traffic light."""
@@ -342,19 +383,24 @@ class TiledMultiCameraRenderer:
         if not self.traffic_light_polylines:
             return []
 
+        # Take this frame's box, center and lens normal: a head is stationary,
+        # but the ego pose that placed it drifts, so its world pose is only
+        # correct for the frame that observed it.
+        frame_polylines = [polylines[frame_id] for polylines in self.traffic_light_polylines]
+
         # Per-camera facing cull: drop heads whose lit lens points away from this
         # camera (it would image only their dark housing back); keep heads whose
-        # orientation is unknown. None means the cull is disabled.
+        # orientation on this frame is unknown. None means the cull is disabled.
         facing_ok = compute_traffic_light_facing_mask(
-            self._tl_centers,
-            self._tl_normals,
-            self._tl_orientation_known,
+            [centers[frame_id] for centers in self._tl_centers],
+            [normals[frame_id] for normals in self._tl_normals],
+            [known[frame_id] for known in self._tl_orientation_known],
             np.asarray(camera_pose, dtype=np.float64)[:3, 3],
             TRAFFIC_LIGHT_FACING_CULL_DEG,
         )
 
         return create_traffic_light_status_geometry_objects_from_data(
-            self.traffic_light_polylines,
+            frame_polylines,
             self.traffic_light_status_dict,
             frame_id,
             camera_pose,
